@@ -1,0 +1,622 @@
+use std::process::Command;
+
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{ConnectionExt, EnterNotifyEvent, NotifyDetail, NotifyMode};
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    Window,
+    WindowClass,
+    AtomEnum,
+    ConfigureWindowAux,
+    CreateWindowAux,
+    PropMode,
+    //ModMask,
+    Keycode,
+    KeyButMask,
+};
+
+use crate::x11::{
+    XServer,
+    Atoms,
+};
+use crate::client::Client;
+use crate::config::{
+    Config,
+    Action,
+};
+
+pub struct WindowManager {
+    xserver: XServer,
+    clients: Vec<Client>,
+    config: Config,
+    focused: Option<Window>,
+    dock_window: Option<Window>,
+    reserved_top: u32,
+}
+
+impl WindowManager {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let (conn, screen_num) = XServer::connect()?;
+        
+        let root: u32 = conn.setup().roots[screen_num].root;
+        
+        XServer::claim_wm(&conn, root)?;
+
+        let atoms = Atoms::load(&conn)?;
+        
+        let xserver: XServer = XServer::new(
+            conn,
+            screen_num,
+            atoms,
+        );
+
+        Self::setup_check_window(&xserver)?;
+
+        let config = Config::default();
+        
+        Self::setup_keybindings(&xserver, &config)?;
+        Self::setup_startup_commands(&config)?;
+        
+        Ok(Self {
+            xserver,
+            clients: Vec::new(),
+            config,
+            focused: None,
+            dock_window: None,
+            reserved_top: 0,
+        })
+    }
+
+    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let event: Event = self.xserver.wait_for_event()?;
+            match event {
+                Event::MapRequest(e) => {
+                    println!(
+                        "[event] MapRequest window=0x{:x}",
+                        e.window
+                    );
+                    self.hdl_map_request(e.window)?;
+                }
+                
+                Event::UnmapNotify(e) => {
+                    println!(
+                        "[event] UnmapNotify window=0x{:x}",
+                        e.window
+                    );
+                    self.hdl_unmap_notify(e.window)?;
+                }
+                
+                Event::ConfigureRequest(e) => {
+                    println!(
+                        "[event] ConfigureRequest window=0x{:x}",
+                        e.window
+                    );
+                    self.hdl_configure_request()?;
+                }
+                
+                Event::EnterNotify(e) => {
+                    println!(
+                        "[event] EnterNotify window=0x{:x}",
+                        e.event
+                    );
+                    self.hdl_enter_notify(e)?;
+                }
+                
+                Event::DestroyNotify(e) => {
+                    println!(
+                        "[event] DestroyNotify window=0x{:x}",
+                        e.window
+                    );
+                    self.hdl_destroy_notify(e.window)?;
+                }
+                
+                Event::KeyPress(e) => {
+                    println!(
+                        "[event] KeyPress keycode={} state={:?}",
+                        e.detail,
+                        e.state
+                    );
+                    self.hdl_key_press(e.detail, e.state)?;
+                }
+
+                Event::PropertyNotify(e) => {
+                    println!(
+                        "[event] PropertyNotify window=0x{:x} atom={}",
+                        e.window,
+                        e.atom,
+                    );
+                    self.hdl_property_notify(
+                        e.window,
+                        e.atom,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn setup_check_window(xserver: &XServer) -> Result<Window, Box<dyn std::error::Error>> {
+        let conn = xserver.connection();
+        let atoms = xserver.atoms();
+        let root = xserver.root();
+
+        let wm_check_window = conn.generate_id()?;
+
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT as u8,
+            wm_check_window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new(),
+        )?;
+
+        let wm_check_window_bytes = wm_check_window.to_ne_bytes();
+
+        conn.change_property(
+            PropMode::REPLACE,
+            wm_check_window,
+            atoms._NET_SUPPORTING_WM_CHECK,
+            AtomEnum::WINDOW,
+            32,
+            1,
+            &wm_check_window_bytes,
+        )?;
+        
+        conn.change_property(
+            PropMode::REPLACE,
+            root,
+            atoms._NET_SUPPORTING_WM_CHECK,
+            AtomEnum::WINDOW,
+            32,
+            1,
+            &wm_check_window_bytes,
+        )?;
+
+        let name = b"srx-wm";
+
+        conn.change_property(
+            PropMode::REPLACE,
+            wm_check_window,
+            atoms._NET_WM_NAME,
+            atoms.UTF8_STRING,
+            8,
+            name.len() as u32,
+            name,
+        )?;
+
+        conn.flush()?;
+
+        Ok(wm_check_window)
+    }
+    
+    fn setup_keybindings(xserver: &XServer, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        for binding in config.keybindings() {
+            let keycode = xserver
+                .keycode_from_keysym(binding.key)?
+                .ok_or_else(|| {
+                    format!(
+                        "key not found in keyboard mapping: {:?}",
+                        binding.key
+                    )
+                })?;
+
+            xserver.grab_key(
+                keycode,
+                binding.modifiers,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn setup_startup_commands(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+        for command in config.startup_commands() {
+            Command::new(&command.program)
+                .args(&command.args)
+                .spawn()?;
+        }
+
+        Ok(())
+    }
+
+    fn focus_next(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.clients.is_empty() {
+            return Ok(());
+        }
+
+        let current = match self.focused {
+            Some(window) => window,
+            None => self.clients[0].window,
+        };
+
+        let index = self
+            .clients
+            .iter()
+            .position(|client| client.window == current)
+            .unwrap_or(0);
+
+        let next = (index + 1) % self.clients.len();
+
+        self.focus(self.clients[next].window)?;
+
+        Ok(())
+    }
+
+    fn focus_previous(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.clients.is_empty() {
+            return Ok(());
+        }
+
+        let current = match self.focused {
+            Some(window) => window,
+            None => self.clients[0].window,
+        };
+
+        let index = self
+            .clients
+            .iter()
+            .position(|client| client.window == current)
+            .unwrap_or(0);
+
+        let previous = if index == 0 {
+            self.clients.len() - 1
+        } else {
+            index - 1
+        };
+
+        self.focus(self.clients[previous].window)?;
+
+        Ok(())
+    }
+
+    fn hdl_key_press(&mut self, keycode: Keycode, modifiers: KeyButMask) -> Result<(), Box<dyn std::error::Error>> {
+        for binding in self.config.keybindings() {
+            let Some(binding_keycode) =
+                self.xserver.keycode_from_keysym(binding.key)?
+                else {
+                    continue;
+                };
+
+            if binding_keycode != keycode {
+                continue;
+            }
+
+            if !modifiers.contains(binding.modifiers) {
+                continue;
+            }
+
+            match &binding.action {
+                Action::Spawn { program, args } => {
+                    Command::new(program).args(args).spawn()?;
+                }
+
+                Action::CloseWindow => {
+                    if let Some(window) = self.focused {
+                        self.xserver.close_window(window)?;
+                    }
+                }
+
+                Action::FocusNext => {
+                    self.focus_next()?;
+                }
+
+                Action::FocusPrevious => {
+                    self.focus_previous()?;
+                }
+            }
+
+            break;
+        }
+
+        Ok(())
+    }
+    
+    fn hdl_map_request(
+        &mut self,
+        window: Window,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.xserver.is_dock_window(window)? {
+            println!(
+                "[dock] mapped window=0x{:x}",
+                window
+            );
+
+            self.dock_window = Some(window);
+
+            self.reserved_top =
+            self.xserver.dock_top_strut(window)?;
+
+            println!(
+                "[dock] reserved_top={}",
+                self.reserved_top
+            );
+
+            self.xserver.map_window(window)?;
+
+            self.arrange()?;
+
+            return Ok(());
+        }
+
+        if self.clients.iter().any(
+            |client| client.window == window
+        ) {
+            return Ok(());
+        }
+
+        self.clients.push(Client {
+            window,
+            mapped: true,
+        });
+
+        self.xserver.set_border_color(
+            window,
+            self.config.unfocused_border(),
+        )?;
+
+        self.arrange()?;
+
+        self.xserver.map_window(window)?;
+
+        self.focus(window)?;
+
+        println!(
+            "Mapped window 0x{:x} (now {} clients)",
+            window,
+            self.clients.len()
+        );
+
+        Ok(())
+    }
+
+    fn hdl_unmap_notify(
+        &mut self,
+        window: Window,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dock_window == Some(window) {
+            println!(
+                "[dock] unmapped window=0x{:x}",
+                window
+            );
+
+            self.dock_window = None;
+            self.reserved_top = 0;
+
+            self.arrange()?;
+
+            return Ok(());
+        }
+
+        let Some(client) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.window == window)
+            else {
+                println!(
+                    "[unmap] window=0x{:x} not managed",
+                    window
+                );
+
+                return Ok(());
+            };
+
+        client.mapped = false;
+
+        println!(
+            "[unmap] window=0x{:x} mapped=false",
+            window
+        );
+
+        if self.focused == Some(window) {
+            self.focused = None;
+
+            let replacement = self
+                .clients
+                .iter()
+                .find(|client| client.mapped)
+                .map(|client| client.window);
+
+            if let Some(window) = replacement {
+                self.focus(window)?;
+            }
+        }
+
+        self.arrange()?;
+
+        Ok(())
+    }
+    
+    fn hdl_configure_request(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.arrange()
+    }
+    
+    fn hdl_enter_notify(&mut self, event: EnterNotifyEvent) -> Result<(), Box<dyn std::error::Error>> {
+        if event.mode != NotifyMode::NORMAL {
+            return Ok(());
+        }
+
+        if event.detail == NotifyDetail::INFERIOR {
+            return Ok(());
+        }
+
+        self.focus(event.event)
+    }
+    
+    fn hdl_destroy_notify(
+        &mut self,
+        window: Window,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dock_window == Some(window) {
+            println!(
+                "[dock] destroyed window=0x{:x}",
+                window
+            );
+
+            self.dock_window = None;
+            self.reserved_top = 0;
+
+            self.arrange()?;
+
+            return Ok(());
+        }
+
+        let before = self.clients.len();
+
+        self.clients.retain(|client| {
+            client.window != window
+        });
+
+        if self.clients.len() == before {
+            return Ok(());
+        }
+
+        if self.focused == Some(window) {
+            self.focused = None;
+
+            let replacement = self
+                .clients
+                .iter()
+                .find(|client| client.mapped)
+                .map(|client| client.window);
+
+            if let Some(window) = replacement {
+                self.focus(window)?;
+            }
+        }
+
+        self.arrange()?;
+
+        Ok(())
+    }
+
+    fn hdl_property_notify(
+        &mut self,
+        window: Window,
+        atom: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dock_window != Some(window) {
+            return Ok(());
+        }
+
+        if atom != self.xserver.atoms()._NET_WM_STRUT_PARTIAL {
+            return Ok(());
+        }
+
+        self.reserved_top =
+        self.xserver.dock_top_strut(window)?;
+
+        println!(
+            "[dock] window=0x{:x} reserved_top={}",
+            window,
+            self.reserved_top
+        );
+
+        self.arrange()?;
+
+        Ok(())
+    }
+
+    fn focus(&mut self, window: Window) -> Result<(), Box<dyn std::error::Error>> {
+        if self.focused == Some(window) {
+            return Ok(());
+        }
+
+        if !self.clients.iter().any(|c| c.window == window) {
+            return Ok(());
+        }
+
+        if let Some(prev) = self.focused {
+            self.xserver.set_border_color(prev, self.config.unfocused_border())?;
+        }
+
+        self.xserver.set_border_color(window, self.config.focused_border())?;
+        self.xserver.set_input_focus(window)?;
+        self.xserver.raise_window(window)?;
+
+        self.focused = Some(window);
+        Ok(())
+    }
+
+    fn arrange(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mapped_clients: Vec<&Client> = self
+            .clients
+            .iter()
+            .filter(|client| client.mapped)
+            .collect();
+
+        let n = mapped_clients.len();
+
+        if n == 0 {
+            return Ok(());
+        }
+
+        let (sw, sh) = self.xserver.screen_size();
+
+        let sw = u32::from(sw);
+        let sh = u32::from(sh);
+
+        let gap = self.config.gaps();
+        let border = self.config.border();
+
+        let outer = gap;
+        let inner = gap;
+
+        let usable_w = sw.saturating_sub(outer * 2);
+
+        let usable_h = sh
+            .saturating_sub(self.reserved_top)
+            .saturating_sub(outer * 2);
+
+        let inner_total =
+            inner.saturating_mul((n as u32).saturating_sub(1));
+
+        let col_w =
+            (usable_w.saturating_sub(inner_total))
+                / n as u32;
+
+        let leftover = usable_w.saturating_sub(
+            inner_total + col_w * n as u32,
+        );
+
+        let mut x = outer;
+
+        for (i, client) in mapped_clients.iter().enumerate() {
+            let this_w = col_w
+                + if i + 1 == n {
+                    leftover
+                } else {
+                    0
+                };
+
+            let inner_w =
+                this_w.saturating_sub(border * 2);
+
+            let inner_h =
+                usable_h.saturating_sub(border * 2);
+
+            let values = ConfigureWindowAux::new()
+                .x(x as i32)
+                .y((outer + self.reserved_top) as i32)
+                .width(inner_w)
+                .height(inner_h)
+                .border_width(border);
+
+            self.xserver.configure_window(
+                client.window,
+                &values,
+            )?;
+
+            x += this_w + inner;
+        }
+
+        Ok(())
+    }
+
+}

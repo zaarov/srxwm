@@ -1,0 +1,16 @@
+use x11rb::protocol::xproto::Window;
+
+pub struct Client {
+    pub window: Window,
+    pub mapped: bool,
+    //pub x: i16,
+    //pub y: i16,
+    //pub width: u16,
+    //pub height: u16,
+}
+
+impl Client {
+    pub fn window(&self) -> Window {
+        self.window
+    }
+}

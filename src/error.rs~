@@ -1,0 +1,30 @@
+use std::fmt;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug)]
+pub enum Error {
+    WindowManager(crate::wm::error::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WindowManager(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WindowManager(err) => Some(err),
+        }
+    }
+}
+
+impl From<crate::wm::error::Error> for Error {
+    fn from(err: crate::wm::error::Error) -> Self {
+        Self::WindowManager(err)
+    }
+}

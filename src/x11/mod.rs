@@ -1,0 +1,263 @@
+pub mod atoms;
+pub use atoms::Atoms;
+
+use x11rb::connection::Connection;
+use x11rb::rust_connection::RustConnection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux,
+    ConfigureWindowAux,
+    ConnectionExt,
+    ClientMessageData,
+    ClientMessageEvent,
+    EventMask,
+    GrabMode,
+    InputFocus,
+    Keycode,
+    ModMask,
+    StackMode,
+    Window,
+    AtomEnum,
+};
+use x11rb::errors::{
+    ConnectError,
+    ConnectionError,
+    ReplyError,
+};
+use xkeysym::Keysym;
+
+pub struct XServer {
+    conn: RustConnection,
+    screen_num: usize,
+    atoms: Atoms,
+}
+
+impl XServer {
+    pub fn new(conn: RustConnection, screen_num: usize, atoms: Atoms) -> Self {
+        Self {
+            conn,
+            screen_num,
+            atoms,
+        }
+    }
+
+    pub fn connect() -> Result<(RustConnection, usize), ConnectError> {
+        Ok(x11rb::connect(None)?)
+    }
+
+    pub fn claim_wm(conn: &RustConnection, root: Window) -> Result<(), ReplyError> {
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new()
+                .event_mask(
+                    EventMask::SUBSTRUCTURE_REDIRECT
+                        | EventMask::SUBSTRUCTURE_NOTIFY,
+                ),
+        )?.check()?;
+        
+        Ok(())
+    }
+
+    pub fn connection(&self) -> &RustConnection {
+        &self.conn
+    }
+
+    pub fn screen_num(&self) -> usize {
+        self.screen_num
+    }
+
+    pub fn atoms(&self) -> &Atoms {
+        &self.atoms
+    }
+
+    pub fn root(&self) -> Window {
+        self.conn.setup().roots[self.screen_num].root
+    }
+    
+    pub fn wait_for_event(&self) -> Result<Event, ConnectionError> {
+        Ok(self.conn.wait_for_event()?)
+    }
+
+    pub fn screen_size(&self) -> (u16, u16) {
+        let screen = &self.conn.setup().roots[self.screen_num];
+        
+        (
+            screen.width_in_pixels,
+            screen.height_in_pixels,
+        )
+    }
+
+    pub fn map_window(&self, window: Window) -> Result<(), ReplyError > {
+        self.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new()
+                .event_mask(
+                    EventMask::ENTER_WINDOW
+                        |EventMask::STRUCTURE_NOTIFY,
+            ),
+        )?;
+        self.conn.map_window(window)?;
+        
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn set_border_color(&self, window: Window, color: u32) -> Result<(), ReplyError> {
+        self.conn.change_window_attributes(
+            window,
+            &ChangeWindowAttributesAux::new()
+                .border_pixel(color),
+        )?;
+        
+        self.conn.flush()?;
+        Ok(())
+    }
+    
+    pub fn configure_window(&self, window: Window, values: &ConfigureWindowAux) -> Result<(), ReplyError> {
+        self.conn.configure_window(window, values)?;
+        
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn set_input_focus(&self, window: Window) -> Result<(), ReplyError> {
+        self.conn.set_input_focus(
+            InputFocus::POINTER_ROOT, // or PARENT
+            window,
+            x11rb::CURRENT_TIME,
+        )?;
+        
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn raise_window(&self, window: Window) -> Result<(), ReplyError> {
+        self.conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+        
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn grab_key(&self, keycode: Keycode, modifiers: ModMask) -> Result<(), ReplyError> {
+        self.conn.grab_key(
+            false,
+            self.root(),
+            modifiers,
+            keycode,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn keycode_from_keysym(&self, keysym: Keysym) -> Result<Option<Keycode>, ReplyError> {
+        let setup = self.conn.setup();
+
+        let min = setup.min_keycode;
+        let max = setup.max_keycode;
+        let count = max - min + 1;
+
+        let mapping = self
+            .conn
+            .get_keyboard_mapping(min, count)?
+            .reply()?;
+
+        let per_keycode = mapping.keysyms_per_keycode as usize;
+        let keysym = keysym.raw();
+        
+        for (index, keysyms) in mapping
+            .keysyms
+            .chunks(per_keycode).enumerate() {
+                if keysyms.contains(&keysym) {
+                    return Ok(Some(
+                        min + index as Keycode
+                    ));
+                }
+            }
+        
+        Ok(None)
+    }
+
+    pub fn close_window(&self, window: Window) -> Result<(), ReplyError> {
+        let atoms = self.atoms();
+
+        let event = ClientMessageEvent::new(
+            32,
+            window,
+            atoms.WM_PROTOCOLS,
+            ClientMessageData::from([
+                atoms.WM_DELETE_WINDOW,
+                x11rb::CURRENT_TIME,
+                0,
+                0,
+                0,
+            ]),
+        );
+
+        self.conn.send_event(
+            false,
+            window,
+            EventMask::NO_EVENT,
+            event,
+        )?;
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn is_dock_window(
+        &self,
+        window: Window,
+    ) -> Result<bool, ReplyError> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms._NET_WM_WINDOW_TYPE,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )?
+            .reply()?;
+
+        let Some(mut values) = reply.value32() else {
+            return Ok(false);
+        };
+
+        Ok(values.any(|atom| {
+            atom == self.atoms._NET_WM_WINDOW_TYPE_DOCK
+        }))
+    }
+
+    pub fn dock_top_strut(
+        &self,
+        window: Window,
+    ) -> Result<u32, ReplyError> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms._NET_WM_STRUT_PARTIAL,
+                AtomEnum::CARDINAL,
+                0,
+                12,
+            )?
+            .reply()?;
+
+        let Some(mut values) = reply.value32() else {
+            return Ok(0);
+        };
+
+        values.next();
+        values.next();
+
+        Ok(values.next().unwrap_or(0))
+    }
+}
