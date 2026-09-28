@@ -4,5 +4,5 @@
 /src/config/parser.rs
 /src/config/error.rs
 /srxwm.toml
-*~
-*#
+~*~
+#*#

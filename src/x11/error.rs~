@@ -1,0 +1,74 @@
+use std::fmt;
+use std::fmt::{
+    Formatter,
+    Display,
+};
+use std::panic::Location;
+use std::error::Error as StdError;
+
+use x11rb::errors::{
+    ConnectError, ConnectionError, ReplyError,
+};
+
+#[derive(Debug)]
+pub struct Error {
+    kind: ErrorKind,
+    location: &'static Location<'static>,
+}
+
+#[derive(Debug)]
+pub enum ErrorKind {
+    Connection(ConnectionError),
+    Connect(ConnectError),
+    Atoms(ReplyError),
+}
+
+impl Error {
+    #[track_caller]
+    pub fn new(kind: ErrorKind) -> Self {
+        Self {
+            kind,
+            location: Location::caller(),
+        }
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            ErrorKind::Connection(e) => {
+                write!(f, "x server connection failed: {} (at {})", e, self.location)
+            }
+            ErrorKind::Connect(e) => {
+                write!(f, "failed to connect to X server: {} (at {})", e, self.location)
+            }
+            ErrorKind::Atoms(e) => {
+                write!(f, "failed to load atoms: {} (at {})", e, self.location)
+            }
+        }
+    }
+}
+
+impl StdError for Error {}
+
+
+impl From<ConnectionError> for Error {
+    #[track_caller]
+    fn from(err: ConnectionError) -> Self {
+        Self::new(ErrorKind::Connection(err))
+    }
+}
+
+impl From<ConnectError> for Error {
+    #[track_caller]
+    fn from(err: ConnectError) -> Self {
+        Self::new(ErrorKind::Connect(err))
+    }
+}
+
+impl From<ReplyError> for Error {
+    #[track_caller]
+    fn from(err: ReplyError) -> Self {
+        Self::new(ErrorKind::Atoms(err))
+    }
+}
