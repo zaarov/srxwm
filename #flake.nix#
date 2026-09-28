@@ -36,7 +36,6 @@
             picom
 	    alacritty
 	    polybar
-	    cowsay
 	  ];
 
 	  shellHook = ''

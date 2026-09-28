@@ -7,121 +7,29 @@ pub struct Config {
     border: u32,
     focused_border: u32,
     unfocused_border: u32,
+    master_width: u32,
+    cursor_theme: Option<String>,
+    cursor_size: u32,
     keybindings: Vec<KeyBinding>,
     startup_commands: Vec<StartupCommand>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        let mod_key: ModMask = ModMask::M4;
-        
-        Self {
-            mod_key,
-            gaps: 14,
-            border: 2,
-            focused_border: 0x8848a8,
-            unfocused_border: 0x4c566a,
-            
-            keybindings: vec![
-                /*
-                KeyBinding {
-                    modifiers: mod_key,
-                    key: Keysym::Return,
-                    action: Action::spawn(
-                        "alacritty",
-                        [
-                            "-o",
-                            "window.opacity=0.85",
-
-                            "-o",
-                            "colors.primary.background=\"#080808\"",
-
-                            "-o",
-                            "colors.primary.foreground=\"#bdbdbd\"",
-                        ],
-                    ),
-                },
-                 */
-                KeyBinding {
-                    modifiers: mod_key,
-                    key: Keysym::Return,
-                    action: Action::spawn(
-                        "st",
-                        std::iter::empty::<&str>(),
-                    ),
-                },
-
-                KeyBinding {
-                    modifiers: mod_key,
-                    key: Keysym::D,
-                    action: Action::spawn(
-                        "rofi",
-                        [
-                            "-show", "drun",
-                            "-show-icons",
-                            "-theme-str", "configuration { font: \"GohuFont 14 Nerd Font 10\"; }",
-                            "-theme-str", "* { background-color: #080808; text-color: #dcdcdc; }",
-                            "-theme-str", "window { location: center; anchor: center; width: 40%; border: 2px; border-color: #8848a8; border-radius: 0px; padding: 8px; background-color: #080808; }",
-                            "-theme-str", "prompt { text-color: #8cc85f; }",
-                            "-theme-str", "textbox-prompt-colon { text-color: #dcdcdc; str: \":\"; }",
-                            "-theme-str", "entry { text-color: #8848a8; }",
-                            "-theme-str", "listview { lines: 12; border: 2px 0px 0px 0px; border-color: #dcdcdc; scrollbar: true; }",
-                            "-theme-str", "scrollbar { handle-color: #dcdcdc; background-color: #080808; width: 4px; }",
-                            "-theme-str", "element normal.normal, element alternate.normal { background-color: #080808; text-color: #dcdcdc; }",
-                            "-theme-str", "element selected.normal { background-color: #242424; text-color: #8848a8; }",
-                            "-theme-str", "element-text, element-icon { background-color: inherit; text-color: inherit; }",
-                        ]
-                    ),
-                },
-
-                KeyBinding {
-                    modifiers: mod_key | ModMask::SHIFT,
-                    key: Keysym::Q,
-                    action: Action::CloseWindow,
-                },
-
-                KeyBinding {
-                    modifiers: mod_key,
-                    key: Keysym::Right,
-                    action: Action::FocusNext,
-                },
-                
-                KeyBinding {
-                    modifiers: mod_key,
-                    key: Keysym::Left,
-                    action: Action::FocusPrevious,
-                },
-            ],
-            
-            startup_commands: vec![
-                StartupCommand::new(
-                    "feh",
-                    [
-                        "--bg-fill",
-                        "/home/zarov/Pictures/cherry.jpg",
-                    ],
-                ),
-
-                StartupCommand::new(
-                    "polybar",
-                    [
-                        "--config=/run/media/zarov/secondary/learning_projects/simp-wm/thirdparty_configs/poly_bar/config.ini",
-                        "example",
-                    ],
-                )
-                
-                /*
-                StartupCommand::new(
-                    "picom",
-                    [
-                        "--backend",
-                        "xrender",
-                    ],
-                ),
-                */
-            ],
-        }
-    }
+pub enum Action {
+    Spawn {
+        program: String,
+        args: Vec<String>,
+    },
+    CloseWindow,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    SwapLeft,
+    SwapRight,
+    SwapUp,
+    SwapDown,
+    MoveToWorkspace(usize),
+    SwitchWorkspace(usize),
 }
 
 pub struct KeyBinding {
@@ -135,6 +43,215 @@ pub struct StartupCommand {
     pub args: Vec<String>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        let mod_key: ModMask = ModMask::M4;
+        
+        Self {
+            mod_key,
+            gaps: 14,
+            border: 2,
+            focused_border: 0x8848a8,
+            unfocused_border: 0x575757,
+            master_width: 50,
+            cursor_theme: None,
+            cursor_size: 24,
+            
+            keybindings: vec![
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::Return,
+                    action: Action::spawn(
+                        "alacritty",
+                        std::iter::empty::<&str>(),
+                    ),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::Q,
+                    action: Action::CloseWindow,
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::Right,
+                    action: Action::FocusRight,
+                },
+                
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::Left,
+                    action: Action::FocusLeft,
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::Up,
+                    action: Action::FocusUp,
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::Down,
+                    action: Action::FocusDown,
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::Left,
+                    action: Action::SwapLeft,
+                },
+                
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::Right,
+                    action: Action::SwapRight,
+                },
+                
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::Up,
+                    action: Action::SwapUp,
+                },
+                
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::Down,
+                    action: Action::SwapDown,
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_1,
+                    action: Action::MoveToWorkspace(0),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_2,
+                    action: Action::MoveToWorkspace(1),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_3,
+                    action: Action::MoveToWorkspace(2),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_4,
+                    action: Action::MoveToWorkspace(3),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_5,
+                    action: Action::MoveToWorkspace(4),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_6,
+                    action: Action::MoveToWorkspace(5),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_7,
+                    action: Action::MoveToWorkspace(6),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_8,
+                    action: Action::MoveToWorkspace(7),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key | ModMask::SHIFT,
+                    key: Keysym::_9,
+                    action: Action::MoveToWorkspace(8),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_1,
+                    action: Action::SwitchWorkspace(0),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_2,
+                    action: Action::SwitchWorkspace(1),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_3,
+                    action: Action::SwitchWorkspace(2),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_4,
+                    action: Action::SwitchWorkspace(3),
+                },
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_5,
+                    action: Action::SwitchWorkspace(4),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_6,
+                    action: Action::SwitchWorkspace(5),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_7,
+                    action: Action::SwitchWorkspace(6),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_8,
+                    action: Action::SwitchWorkspace(7),
+                },
+
+
+                KeyBinding {
+                    modifiers: mod_key,
+                    key: Keysym::_9,
+                    action: Action::SwitchWorkspace(8),
+                },
+            ],
+            
+            startup_commands: vec![
+                StartupCommand::new(
+                    "feh",
+                    [
+                        "--bg-fill",
+                        "path/to/bg",
+                    ],
+                ),                
+            ],
+        }
+    }
+}
+
 impl StartupCommand {
     pub fn new(program: impl Into<String>, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
@@ -142,16 +259,6 @@ impl StartupCommand {
             args: args.into_iter().map(Into::into).collect(),
         }
     }
-}
-
-pub enum Action {
-    Spawn {
-        program: String,
-        args: Vec<String>,
-    },
-    CloseWindow,
-    FocusNext,
-    FocusPrevious,
 }
 
 impl Action {
@@ -162,7 +269,6 @@ impl Action {
         }
     }
 }
-
 
 impl Config {
     pub fn mod_key(&self) -> ModMask {
@@ -185,11 +291,23 @@ impl Config {
         self.unfocused_border
     }
 
+    pub fn master_width(&self) -> u32 {
+        self.master_width
+    }
+
     pub fn startup_commands(&self) -> &[StartupCommand] {
         &self.startup_commands
     }
     
     pub fn keybindings(&self) -> &[KeyBinding] {
         &self.keybindings
+    }
+
+    pub fn cursor_theme(&self) -> Option<&str> {
+        self.cursor_theme.as_deref()
+    }
+
+    pub fn cursor_size(&self) -> u32 {
+        self.cursor_size
     }
 }

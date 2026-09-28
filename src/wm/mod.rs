@@ -1,222 +1,130 @@
+mod error;
+mod client;
+mod workspace;
+
+// TODO: add multiple monitor support
+// mod monitor;
+
+pub use error::WmError;
+pub use client::Client;
+pub use workspace::{
+    Workspace,
+    Layout,
+};
+
+// TODO: add multiple monitor support
+// pub use monitor::Monitor;
+
 use std::process::Command;
 
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, EnterNotifyEvent, NotifyDetail, NotifyMode};
-use x11rb::protocol::Event;
-use x11rb::protocol::xproto::{
-    Window,
-    WindowClass,
-    AtomEnum,
-    ConfigureWindowAux,
-    CreateWindowAux,
-    PropMode,
-    //ModMask,
-    Keycode,
-    KeyButMask,
-};
-
-use crate::x11::{
-    XServer,
-    Atoms,
-};
-use crate::client::Client;
+use crate::x11::XServer;
 use crate::config::{
     Config,
     Action,
 };
 
+use x11rb::protocol::xproto::{
+    ButtonPressEvent,
+    KeyPressEvent,
+    MappingNotifyEvent,
+    UnmapNotifyEvent,
+    EnterNotifyEvent,
+    MotionNotifyEvent,
+    Rectangle,
+    Timestamp,
+    Window,
+    ConfigureRequestEvent,
+    ConfigWindow,
+    ModMask,
+    KeyButMask,
+    NotifyMode,
+    NotifyDetail,
+    ButtonIndex,
+};
+use x11rb::protocol::Event;
+
+const WORKSPACE_COUNT: usize = 9;
+
+const WORKSPACE_NAMES: &[u8] = &[
+    b'1', 0,
+    b'2', 0,
+    b'3', 0,
+    b'4', 0,
+    b'5', 0,
+    b'6', 0,
+    b'7', 0,
+    b'8', 0,
+    b'9', 0,
+];
+
+struct MoveState {
+    window: Window,
+    pointer_x: i16,
+    pointer_y: i16,
+    geometry: Rectangle,
+}
+
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 pub struct WindowManager {
     xserver: XServer,
-    clients: Vec<Client>,
+    workspaces: Vec<Workspace>,
+    focused_workspace: usize,
     config: Config,
-    focused: Option<Window>,
     dock_window: Option<Window>,
     reserved_top: u32,
+    ignore_enter_notify: bool,
+    moving: Option<MoveState>,
+    // TODO: add multiple monitor support
+    // monitors: Vec<Monitor>,
+    // focused_monitor: usize,
 }
 
 impl WindowManager {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let (conn, screen_num) = XServer::connect()?;
-        
-        let root: u32 = conn.setup().roots[screen_num].root;
-        
-        XServer::claim_wm(&conn, root)?;
+    pub fn new() -> Result<Self, WmError> {
+        let xserver: XServer = XServer::connect()?;
+        let mut workspaces: Vec<Workspace> = Vec::with_capacity(WORKSPACE_COUNT);
 
-        let atoms = Atoms::load(&conn)?;
+        for _ in 0..WORKSPACE_COUNT {
+            workspaces.push(Workspace::new());
+        }
         
-        let xserver: XServer = XServer::new(
-            conn,
-            screen_num,
-            atoms,
-        );
-
-        Self::setup_check_window(&xserver)?;
-
-        let config = Config::default();
-        
-        Self::setup_keybindings(&xserver, &config)?;
-        Self::setup_startup_commands(&config)?;
-        
-        Ok(Self {
+        let wm: WindowManager = Self {
             xserver,
-            clients: Vec::new(),
-            config,
-            focused: None,
+            workspaces,
+            focused_workspace: 0,
+            config: Config::default(),
             dock_window: None,
             reserved_top: 0,
-        })
-    }
+            ignore_enter_notify: false,
+            moving: None,
 
-    pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            let event: Event = self.xserver.wait_for_event()?;
-            match event {
-                Event::MapRequest(e) => {
-                    println!(
-                        "[event] MapRequest window=0x{:x}",
-                        e.window
-                    );
-                    self.hdl_map_request(e.window)?;
-                }
-                
-                Event::UnmapNotify(e) => {
-                    println!(
-                        "[event] UnmapNotify window=0x{:x}",
-                        e.window
-                    );
-                    self.hdl_unmap_notify(e.window)?;
-                }
-                
-                Event::ConfigureRequest(e) => {
-                    println!(
-                        "[event] ConfigureRequest window=0x{:x}",
-                        e.window
-                    );
-                    self.hdl_configure_request()?;
-                }
-                
-                Event::EnterNotify(e) => {
-                    println!(
-                        "[event] EnterNotify window=0x{:x}",
-                        e.event
-                    );
-                    self.hdl_enter_notify(e)?;
-                }
-                
-                Event::DestroyNotify(e) => {
-                    println!(
-                        "[event] DestroyNotify window=0x{:x}",
-                        e.window
-                    );
-                    self.hdl_destroy_notify(e.window)?;
-                }
-                
-                Event::KeyPress(e) => {
-                    println!(
-                        "[event] KeyPress keycode={} state={:?}",
-                        e.detail,
-                        e.state
-                    );
-                    self.hdl_key_press(e.detail, e.state)?;
-                }
+            // TODO: add multiple monitor support
+            // monitors: Vec::new(),
+            // focused_monitor: 0,
+        };
 
-                Event::PropertyNotify(e) => {
-                    println!(
-                        "[event] PropertyNotify window=0x{:x} atom={}",
-                        e.window,
-                        e.atom,
-                    );
-                    self.hdl_property_notify(
-                        e.window,
-                        e.atom,
-                    )?;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn setup_check_window(xserver: &XServer) -> Result<Window, Box<dyn std::error::Error>> {
-        let conn = xserver.connection();
-        let atoms = xserver.atoms();
-        let root = xserver.root();
-
-        let wm_check_window = conn.generate_id()?;
-
-        conn.create_window(
-            x11rb::COPY_DEPTH_FROM_PARENT as u8,
-            wm_check_window,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            0,
-            &CreateWindowAux::new(),
+        wm.xserver.claim_wm()?;
+        wm.xserver.setup_wm_check()?;
+        wm.xserver.setup_net_supported()?;
+        wm.xserver.setup_desktops(
+            WORKSPACE_COUNT,
+            WORKSPACE_NAMES,
         )?;
-
-        let wm_check_window_bytes = wm_check_window.to_ne_bytes();
-
-        conn.change_property(
-            PropMode::REPLACE,
-            wm_check_window,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            32,
-            1,
-            &wm_check_window_bytes,
-        )?;
+        wm.xserver.set_normal_cursor(wm.xserver.root())?;
         
-        conn.change_property(
-            PropMode::REPLACE,
-            root,
-            atoms._NET_SUPPORTING_WM_CHECK,
-            AtomEnum::WINDOW,
-            32,
-            1,
-            &wm_check_window_bytes,
-        )?;
-
-        let name = b"srx-wm";
-
-        conn.change_property(
-            PropMode::REPLACE,
-            wm_check_window,
-            atoms._NET_WM_NAME,
-            atoms.UTF8_STRING,
-            8,
-            name.len() as u32,
-            name,
-        )?;
-
-        conn.flush()?;
-
-        Ok(wm_check_window)
+        Self::setup_startup_commands(&wm.config)?;
+        Self::setup_keybindings(&wm)?;
+        
+        Ok(wm)
     }
     
-    fn setup_keybindings(xserver: &XServer, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-        for binding in config.keybindings() {
-            let keycode = xserver
-                .keycode_from_keysym(binding.key)?
-                .ok_or_else(|| {
-                    format!(
-                        "key not found in keyboard mapping: {:?}",
-                        binding.key
-                    )
-                })?;
-
-            xserver.grab_key(
-                keycode,
-                binding.modifiers,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn setup_startup_commands(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    fn setup_startup_commands(config: &Config) -> Result<(), WmError> {
         for command in config.startup_commands() {
             Command::new(&command.program)
                 .args(&command.args)
@@ -226,218 +134,194 @@ impl WindowManager {
         Ok(())
     }
 
-    fn focus_next(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.clients.is_empty() {
-            return Ok(());
-        }
+    fn setup_keybindings(wm: &WindowManager) -> Result<(), WmError> {
+        for binding in wm.config.keybindings() {
+            let keycodes = wm.xserver.keycodes_for_keysym(binding.key)?;
 
-        let current = match self.focused {
-            Some(window) => window,
-            None => self.clients[0].window,
-        };
-
-        let index = self
-            .clients
-            .iter()
-            .position(|client| client.window == current)
-            .unwrap_or(0);
-
-        let next = (index + 1) % self.clients.len();
-
-        self.focus(self.clients[next].window)?;
-
-        Ok(())
-    }
-
-    fn focus_previous(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.clients.is_empty() {
-            return Ok(());
-        }
-
-        let current = match self.focused {
-            Some(window) => window,
-            None => self.clients[0].window,
-        };
-
-        let index = self
-            .clients
-            .iter()
-            .position(|client| client.window == current)
-            .unwrap_or(0);
-
-        let previous = if index == 0 {
-            self.clients.len() - 1
-        } else {
-            index - 1
-        };
-
-        self.focus(self.clients[previous].window)?;
-
-        Ok(())
-    }
-
-    fn hdl_key_press(&mut self, keycode: Keycode, modifiers: KeyButMask) -> Result<(), Box<dyn std::error::Error>> {
-        for binding in self.config.keybindings() {
-            let Some(binding_keycode) =
-                self.xserver.keycode_from_keysym(binding.key)?
-                else {
-                    continue;
-                };
-
-            if binding_keycode != keycode {
-                continue;
+            for keycode in keycodes {
+                wm.xserver.grab_key(
+                    keycode,
+                    binding.modifiers,
+                )?;
             }
-
-            if !modifiers.contains(binding.modifiers) {
-                continue;
-            }
-
-            match &binding.action {
-                Action::Spawn { program, args } => {
-                    Command::new(program).args(args).spawn()?;
-                }
-
-                Action::CloseWindow => {
-                    if let Some(window) = self.focused {
-                        self.xserver.close_window(window)?;
-                    }
-                }
-
-                Action::FocusNext => {
-                    self.focus_next()?;
-                }
-
-                Action::FocusPrevious => {
-                    self.focus_previous()?;
-                }
-            }
-
-            break;
         }
 
         Ok(())
     }
     
-    fn hdl_map_request(
-        &mut self,
-        window: Window,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(&mut self) -> Result<(), WmError> {
+        loop {
+            let event: Event = self.xserver.wait_for_event()?;
+            self.hdl_event(event)?;
+        }
+    }
+
+    fn hdl_event(&mut self, event: Event) -> Result<(), WmError> {
+        let sent_event = event.sent_event();
+        
+        match event {
+            Event::MapRequest(e) => self.hdl_map_request(e.window)?,
+            Event::UnmapNotify(e) => self.hdl_unmap_notify(e, sent_event)?,
+            Event::DestroyNotify(e) => self.hdl_destroy_notify(e.window)?,
+            Event::ConfigureRequest(e) => self.hdl_configure_request(e)?,
+            Event::EnterNotify(e) => self.hdl_enter_notify(e)?,
+            Event::KeyPress(e) => self.hdl_key_press(e)?,
+            Event::ButtonPress(e) => self.hdl_button_press(e)?,
+            Event::MotionNotify(e) => self.hdl_motion_notify(e)?,
+            Event::ButtonRelease(e) => self.hdl_button_release(e)?,
+            _ => {},
+        }
+        
+        self.xserver.flush()?;
+        
+        Ok(())
+    }
+
+    fn hdl_map_request(&mut self, window: Window) -> Result<(), WmError> {
+        if self.focused_workspace().client(window).is_some() {
+            return Ok(());
+        }
+
+        self.xserver.select_window_events(window)?;
+
         if self.xserver.is_dock_window(window)? {
-            println!(
-                "[dock] mapped window=0x{:x}",
-                window
-            );
-
-            self.dock_window = Some(window);
-
-            self.reserved_top =
-            self.xserver.dock_top_strut(window)?;
-
-            println!(
-                "[dock] reserved_top={}",
-                self.reserved_top
-            );
-
-            self.xserver.map_window(window)?;
-
-            self.arrange()?;
-
+            self.manage_dock(window)?;
             return Ok(());
         }
 
-        if self.clients.iter().any(
-            |client| client.window == window
-        ) {
-            return Ok(());
+        let geometry = self.xserver.window_geometry(window)?;
+        let floating = self.xserver.should_float(window)?;
+
+        let mut client = Client::new(window, geometry);
+        client.set_floating(floating);
+
+        if floating {
+            self.xserver.grab_button(
+                window,
+                ButtonIndex::M1,
+                ModMask::M1,
+            )?;
         }
 
-        self.clients.push(Client {
-            window,
-            mapped: true,
-        });
-
-        self.xserver.set_border_color(
-            window,
-            self.config.unfocused_border(),
-        )?;
+        self.focused_workspace_mut().add_client(client);
 
         self.arrange()?;
 
         self.xserver.map_window(window)?;
-
-        self.focus(window)?;
-
-        println!(
-            "Mapped window 0x{:x} (now {} clients)",
-            window,
-            self.clients.len()
-        );
+        self.focus_client(window, None)?;
 
         Ok(())
     }
-
-    fn hdl_unmap_notify(
-        &mut self,
-        window: Window,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.dock_window == Some(window) {
-            println!(
-                "[dock] unmapped window=0x{:x}",
-                window
-            );
-
-            self.dock_window = None;
-            self.reserved_top = 0;
-
-            self.arrange()?;
-
+    
+    fn hdl_unmap_notify(&mut self, event: UnmapNotifyEvent, sent_event: bool) -> Result<(), WmError> {
+        if sent_event {
             return Ok(());
         }
 
-        let Some(client) = self
-            .clients
-            .iter_mut()
-            .find(|client| client.window == window)
-            else {
-                println!(
-                    "[unmap] window=0x{:x} not managed",
-                    window
-                );
+        let was_focused =
+            self.focused_workspace().focused_client() == Some(event.window);
 
-                return Ok(());
-            };
-
-        client.mapped = false;
-
-        println!(
-            "[unmap] window=0x{:x} mapped=false",
-            window
-        );
-
-        if self.focused == Some(window) {
-            self.focused = None;
-
-            let replacement = self
-                .clients
-                .iter()
-                .find(|client| client.mapped)
-                .map(|client| client.window);
-
-            if let Some(window) = replacement {
-                self.focus(window)?;
-            }
-        }
+        self.focused_workspace_mut()
+            .remove_client(event.window);
 
         self.arrange()?;
+
+        if was_focused {
+            self.focused_workspace_mut()
+                .clear_focused_client();
+
+            if let Some(next) = self
+                .focused_workspace()
+                .clients()
+                .first()
+                .map(Client::window)
+            {
+                self.focus_client(next, None)?;
+            }
+        }
 
         Ok(())
     }
     
-    fn hdl_configure_request(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.arrange()
+    fn hdl_destroy_notify(&mut self, window: Window) -> Result<(), WmError> {
+        let was_focused =
+            self.focused_workspace().focused_client() == Some(window);
+
+        self.focused_workspace_mut().remove_client(window);
+
+        self.arrange()?;
+
+        if was_focused {
+            self.focused_workspace_mut()
+                .clear_focused_client();
+
+            if let Some(next) = self
+                .focused_workspace()
+                .clients()
+                .iter()
+                .find(|client| client.is_mapped())
+                .map(Client::window)
+            {
+                self.focus_client(next, None)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    // TODO: refactor this
+    fn hdl_configure_request(&mut self, event: ConfigureRequestEvent) -> Result<(), WmError> {
+        let floating = match self.focused_workspace().client(event.window) {
+            Some(client) => client.is_floating(),
+            None => {
+                self.xserver.configure_window_request(&event)?;
+                return Ok(());
+            }
+        };
+
+        if !floating {
+            self.arrange()?;
+            return Ok(());
+        }
+
+        let mut geometry = match self.focused_workspace().client(event.window) {
+            Some(client) => client.geometry(),
+            None => return Ok(()),
+        };
+
+        if event.value_mask.contains(ConfigWindow::X) {
+            geometry.x = event.x;
+        }
+
+        if event.value_mask.contains(ConfigWindow::Y) {
+            geometry.y = event.y;
+        }
+
+        if event.value_mask.contains(ConfigWindow::WIDTH) {
+            geometry.width = event.width;
+        }
+
+        if event.value_mask.contains(ConfigWindow::HEIGHT) {
+            geometry.height = event.height;
+        }
+
+        self.set_client_geometry(event.window, geometry);
+
+        self.xserver.configure_window(
+            event.window,
+            geometry,
+            self.config.border(),
+        )?;
+
+        Ok(())
     }
     
-    fn hdl_enter_notify(&mut self, event: EnterNotifyEvent) -> Result<(), Box<dyn std::error::Error>> {
+    fn hdl_enter_notify(&mut self, event: EnterNotifyEvent) -> Result<(), WmError> {
+        if self.ignore_enter_notify {
+            self.ignore_enter_notify = false;
+            return Ok(());
+        }
+
         if event.mode != NotifyMode::NORMAL {
             return Ok(());
         }
@@ -446,177 +330,1023 @@ impl WindowManager {
             return Ok(());
         }
 
-        self.focus(event.event)
+        self.focus_client(event.event, Some(event.time))?;
+
+        Ok(())
     }
-    
-    fn hdl_destroy_notify(
-        &mut self,
-        window: Window,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.dock_window == Some(window) {
-            println!(
-                "[dock] destroyed window=0x{:x}",
-                window
-            );
 
-            self.dock_window = None;
-            self.reserved_top = 0;
+    fn hdl_key_press(&mut self, event: KeyPressEvent) -> Result<(), WmError> {
+        let event_modifiers = event.state.bits() & !u16::from(ModMask::LOCK);
 
-            self.arrange()?;
+        for binding in self.config.keybindings() {
+            let binding_modifiers = u16::from(binding.modifiers);
 
+            if event_modifiers != binding_modifiers {
+                continue;
+            }
+
+            let keycodes = self.xserver.keycodes_for_keysym(binding.key)?;
+
+            if !keycodes.contains(&event.detail) {
+                continue;
+            }
+
+            match &binding.action {
+                Action::Spawn { program, args } => {
+                    Command::new(program)
+                        .args(args)
+                        .spawn()?;
+                }
+
+                Action::CloseWindow => {
+                    if let Some(window) = self.focused_workspace().focused_client() {
+                        self.xserver.close_window(window, event.time)?;
+                    }
+                }
+
+                Action::FocusLeft => {self.focus_direction(Direction::Left)?;}
+
+                Action::FocusRight => {self.focus_direction(Direction::Right)?;}
+
+                Action::FocusUp => {self.focus_direction(Direction::Up)?;}
+
+                Action::FocusDown => {self.focus_direction(Direction::Down)?;}
+                
+                Action::SwapLeft => {
+                    self.swap_direction(Direction::Left)?;
+                }
+
+                Action::SwapRight => {
+                    self.swap_direction(Direction::Right)?;
+                }
+
+                Action::SwapUp => {
+                    self.swap_direction(Direction::Up)?;
+                }
+
+                Action::SwapDown => {
+                    self.swap_direction(Direction::Down)?;
+                }
+
+                Action::MoveToWorkspace(workspace) => {
+                    self.move_to_workspace(*workspace)?;
+                }
+
+                Action::SwitchWorkspace(workspace) => {
+                    self.switch_workspace(*workspace)?;
+                }
+            }
+
+            break;
+        }
+
+        Ok(())
+    }
+
+    fn hdl_button_press(&mut self, event: ButtonPressEvent) -> Result<(), WmError> {
+        if event.detail != u8::from(ButtonIndex::M1) {
             return Ok(());
         }
 
-        let before = self.clients.len();
+        if !event.state.contains(KeyButMask::MOD1) {
+            return Ok(());
+        }
 
-        self.clients.retain(|client| {
-            client.window != window
+        let window = event.event;
+
+        let geometry = match self.focused_workspace().client(window) {
+            Some(client) => {
+                if !client.is_floating() {
+                    return Ok(());
+                }
+
+                client.geometry()
+            }
+            None => return Ok(()),
+        };
+
+        self.focus_client(window, Some(event.time))?;
+
+        self.moving = Some(MoveState {
+            window,
+            pointer_x: event.root_x,
+            pointer_y: event.root_y,
+            geometry,
         });
 
-        if self.clients.len() == before {
+        self.xserver.grab_pointer_move()?;
+
+        Ok(())
+    }
+    
+    fn hdl_motion_notify(&mut self, event: MotionNotifyEvent) -> Result<(), WmError> {
+        let (window, pointer_x, pointer_y, geometry) =
+            match self.moving.as_ref() {
+                Some(state) => (
+                state.window,
+                state.pointer_x,
+                state.pointer_y,
+                state.geometry,
+                ),
+                None => return Ok(()),
+            };
+
+        let delta_x =
+            i32::from(event.root_x) - i32::from(pointer_x);
+
+        let delta_y =
+            i32::from(event.root_y) - i32::from(pointer_y);
+
+        let geometry = Rectangle {
+            x: (i32::from(geometry.x) + delta_x) as i16,
+            y: (i32::from(geometry.y) + delta_y) as i16,
+            width: geometry.width,
+            height: geometry.height,
+        };
+
+        self.set_client_geometry(window, geometry);
+
+        self.xserver.configure_window(
+            window,
+            geometry,
+            self.config.border(),
+        )?;
+
+        Ok(())
+    }
+    
+    fn hdl_button_release(&mut self, event: ButtonPressEvent) -> Result<(), WmError> {
+        if event.detail != u8::from(ButtonIndex::M1) {
             return Ok(());
         }
 
-        if self.focused == Some(window) {
-            self.focused = None;
+        if self.moving.is_none() {
+            return Ok(());
+        }
 
-            let replacement = self
-                .clients
-                .iter()
-                .find(|client| client.mapped)
-                .map(|client| client.window);
+        self.moving = None;
 
-            if let Some(window) = replacement {
-                self.focus(window)?;
+        self.xserver.ungrab_pointer()?;
+
+        Ok(())
+    }
+    
+    fn arrange(&mut self) -> Result<(), WmError> {
+        let layout = self.workspaces[self.focused_workspace].layout();
+
+        match layout {
+            Layout::MasterStack => self.arrange_master()?,
+            Layout::Tree => self.arrange_tree()?,
+            Layout::Horizontal => self.arrange_hor()?,
+            Layout::Vertical => self.arrange_vert()?,
+            Layout::Tabbed => self.arrange_tab()?,
+            Layout::Floating => self.arrange_float()?,
+        }
+
+        Ok(())
+    }
+
+    // Recheck this logic later
+    fn arrange_master(&mut self) -> Result<(), WmError> {
+        let (tiled_windows, floating_windows) = {
+            let clients: &[Client] = self.focused_workspace().clients();
+
+            let mut tiled_windows: Vec<Window> = Vec::new();
+            let mut floating_windows: Vec<Window> = Vec::new();
+
+            for client in clients {   
+                if client.is_floating() {
+                    floating_windows.push(client.window());
+                } else {
+                    tiled_windows.push(client.window());
+                }
+            }
+
+            (tiled_windows, floating_windows)
+        };
+
+        for window in floating_windows {
+            self.arrange_float_win(window)?;
+        }
+
+        if tiled_windows.is_empty() {
+            return Ok(());
+        }
+
+        let screen: Rectangle = self.xserver.screen_geometry();
+
+        let gap: u32 = self.config.gaps();
+        let border: u32 = self.config.border();
+
+        let screen_x: i32 = i32::from(screen.x);
+        let screen_y: i32 = i32::from(screen.y) + self.reserved_top as i32;
+        let screen_width: u32 = u32::from(screen.width);
+        let screen_height: u32 = u32::from(screen.height)
+            .saturating_sub(self.reserved_top);
+
+        let clients_count: usize = tiled_windows.len();
+
+        if clients_count == 1 {
+            let window = tiled_windows[0];
+
+            let x = screen_x + gap as i32;
+            let y = screen_y + gap as i32;
+
+            let width = screen_width
+                .saturating_sub(gap.saturating_mul(2))
+                .saturating_sub(border.saturating_mul(2));
+
+            let height = screen_height
+                .saturating_sub(gap.saturating_mul(2))
+                .saturating_sub(border.saturating_mul(2));
+
+            let geometry = Rectangle {
+                x: x as i16,
+                y: y as i16,
+                width: width as u16,
+                height: height as u16,
+            };
+
+            self.set_client_geometry(window, geometry);
+
+            self.xserver.configure_window(
+                window,
+                geometry,
+                border,
+            )?;
+
+            return Ok(());
+        }
+
+        let outer_width = screen_width
+            .saturating_sub(gap.saturating_mul(2));
+
+        let outer_height = screen_height
+            .saturating_sub(gap.saturating_mul(2));
+
+        let horizontal_overhead = gap
+            .saturating_add(border.saturating_mul(4));
+
+        let usable_width = outer_width
+            .saturating_sub(horizontal_overhead);
+
+        let master_width = usable_width
+            .saturating_mul(self.config.master_width())
+            / 100;
+
+        let stack_width = usable_width
+            .saturating_sub(master_width);
+
+        let master_x = screen_x + gap as i32;
+        let master_y = screen_y + gap as i32;
+
+        let master_height = outer_height
+            .saturating_sub(border.saturating_mul(2));
+
+        let master_geometry = Rectangle {
+            x: master_x as i16,
+            y: master_y as i16,
+            width: master_width as u16,
+            height: master_height as u16,
+        };
+
+        let master_window = tiled_windows[0];
+
+        let mut geometries: Vec<(Window, Rectangle)> =
+            Vec::with_capacity(clients_count);
+
+        geometries.push((master_window, master_geometry));
+
+        let stack_count = clients_count - 1;
+
+        let stack_gap_total = gap
+            .saturating_mul((stack_count - 1) as u32);
+
+        let stack_border_total = border
+            .saturating_mul(2)
+            .saturating_mul(stack_count as u32);
+
+        let stack_content_height = outer_height
+            .saturating_sub(stack_gap_total)
+            .saturating_sub(stack_border_total);
+
+        let base_height = stack_content_height
+            / stack_count as u32;
+
+        let remainder = stack_content_height
+            % stack_count as u32;
+
+        let stack_x = master_x
+            + master_width as i32
+            + border.saturating_mul(2) as i32
+            + gap as i32;
+
+        for index in 0..stack_count {
+            let window = tiled_windows[index + 1];
+
+            let y = master_y
+                + index as i32
+                    * (base_height
+                        + border.saturating_mul(2)
+                        + gap) as i32;
+
+            let height = if index == stack_count - 1 {
+                base_height + remainder
+            } else {
+                base_height
+            };
+
+            let geometry = Rectangle {
+                x: stack_x as i16,
+                y: y as i16,
+                width: stack_width as u16,
+                height: height as u16,
+            };
+
+            geometries.push((window, geometry));
+        }
+
+        {
+            let workspace = self.focused_workspace_mut();
+
+            for &(window, geometry) in &geometries {
+                if let Some(client) = workspace.client_mut(window) {
+                    client.set_geometry(geometry);
+                }
             }
         }
 
-        self.arrange()?;
+        for &(window, geometry) in &geometries {
+            self.xserver.configure_window(
+                window,
+                geometry,
+                border,
+            )?;
+        }
 
         Ok(())
     }
+    
+    fn arrange_tree(&self) -> Result<(), WmError> {
+        todo!("impl tree tiling algorithm")
+    }
 
-    fn hdl_property_notify(
-        &mut self,
-        window: Window,
-        atom: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if self.dock_window != Some(window) {
-            return Ok(());
-        }
+    fn arrange_hor(&self) -> Result<(), WmError> {
+        todo!("impl horizontal tiling algorithm")
+    }
 
-        if atom != self.xserver.atoms()._NET_WM_STRUT_PARTIAL {
-            return Ok(());
-        }
+    fn arrange_vert(&self) -> Result<(), WmError> {
+        todo!("impl vertical tiling algorithm")
+    }
 
-        self.reserved_top =
-        self.xserver.dock_top_strut(window)?;
+    fn arrange_tab(&self) -> Result<(), WmError> {
+        todo!("impl tabs tiling algorithm")
+    }
 
-        println!(
-            "[dock] window=0x{:x} reserved_top={}",
+    fn arrange_float(&self) -> Result<(), WmError> {
+        todo!("impl floating workspace state")
+    }
+
+    // Recheck this logic later
+    fn arrange_float_win(&mut self, window: Window) -> Result<(), WmError> {
+        let geometry = match self.focused_workspace().client(window) {
+            Some(client) => client.geometry(),
+            None => return Ok(()),
+        };
+
+        self.xserver.configure_window(
             window,
-            self.reserved_top
-        );
+            geometry,
+            self.config.border(),
+        )?;
 
+        Ok(())
+    }
+
+    // HELPERS
+    fn focused_workspace(&self) -> &Workspace {
+        &self.workspaces[self.focused_workspace]
+    }
+
+    fn focused_workspace_mut(&mut self) -> &mut Workspace {
+        &mut self.workspaces[self.focused_workspace]
+    }
+
+    fn set_client_geometry(&mut self, window: Window, geometry: Rectangle) {
+        if let Some(client) = self.focused_workspace_mut().client_mut(window) {
+            client.set_geometry(geometry);
+        }
+    }
+
+    fn focus_client(&mut self, window: Window, time: Option<Timestamp>) -> Result<(), WmError> {
+        if self.focused_workspace().client(window).is_none() {
+            return Ok(());
+        }
+
+        let previous = self.focused_workspace().focused_client();
+
+        if previous != Some(window) {
+            if let Some(previous) = previous {
+                self.xserver.set_border_color(
+                    previous,
+                    self.config.unfocused_border(),
+                )?;
+            }
+
+            self.focused_workspace_mut()
+                .set_focused_client(window);
+        }
+
+        self.xserver.set_border_color(
+            window,
+            self.config.focused_border(),
+        )?;
+
+        self.xserver.set_input_focus(window, time)?;
+
+        Ok(())
+    }
+
+    fn switch_workspace(&mut self, workspace: usize) -> Result<(), WmError> {
+        if workspace >= self.workspaces.len() {
+            return Ok(());
+        }
+
+        if workspace == self.focused_workspace {
+            return Ok(());
+        }
+
+        let old_workspace = self.focused_workspace;
+
+        match self.workspaces[old_workspace].focused_client() {
+            Some(window) => {
+                self.xserver.set_border_color(
+                    window,
+                    self.config.unfocused_border(),
+                )?;
+            }
+            None => {}
+        }
+
+        self.hide_workspace(old_workspace)?;
+
+        self.focused_workspace = workspace;
+
+        self.show_workspace(workspace)?;
+        
         self.arrange()?;
 
-        Ok(())
-    }
+        self.xserver.update_current_workspace(workspace as u32)?;
+        
+        match self.workspaces[workspace].focused_client() {
+            Some(window) => {
+                self.focus_client(window, None)?;
+            }
 
-    fn focus(&mut self, window: Window) -> Result<(), Box<dyn std::error::Error>> {
-        if self.focused == Some(window) {
-            return Ok(());
-        }
+            None => {
+                let window = match self.workspaces[workspace].clients().first() {
+                    Some(client) => client.window(),
+                    None => {
+                        self.xserver.set_input_focus(
+                            self.xserver.root(),
+                            None,
+                        )?;
 
-        if !self.clients.iter().any(|c| c.window == window) {
-            return Ok(());
-        }
-
-        if let Some(prev) = self.focused {
-            self.xserver.set_border_color(prev, self.config.unfocused_border())?;
-        }
-
-        self.xserver.set_border_color(window, self.config.focused_border())?;
-        self.xserver.set_input_focus(window)?;
-        self.xserver.raise_window(window)?;
-
-        self.focused = Some(window);
-        Ok(())
-    }
-
-    fn arrange(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mapped_clients: Vec<&Client> = self
-            .clients
-            .iter()
-            .filter(|client| client.mapped)
-            .collect();
-
-        let n = mapped_clients.len();
-
-        if n == 0 {
-            return Ok(());
-        }
-
-        let (sw, sh) = self.xserver.screen_size();
-
-        let sw = u32::from(sw);
-        let sh = u32::from(sh);
-
-        let gap = self.config.gaps();
-        let border = self.config.border();
-
-        let outer = gap;
-        let inner = gap;
-
-        let usable_w = sw.saturating_sub(outer * 2);
-
-        let usable_h = sh
-            .saturating_sub(self.reserved_top)
-            .saturating_sub(outer * 2);
-
-        let inner_total =
-            inner.saturating_mul((n as u32).saturating_sub(1));
-
-        let col_w =
-            (usable_w.saturating_sub(inner_total))
-                / n as u32;
-
-        let leftover = usable_w.saturating_sub(
-            inner_total + col_w * n as u32,
-        );
-
-        let mut x = outer;
-
-        for (i, client) in mapped_clients.iter().enumerate() {
-            let this_w = col_w
-                + if i + 1 == n {
-                    leftover
-                } else {
-                    0
+                        return Ok(());
+                    }
                 };
 
-            let inner_w =
-                this_w.saturating_sub(border * 2);
+                self.focus_client(window, None)?;
+            }
+        }
 
-            let inner_h =
-                usable_h.saturating_sub(border * 2);
+        Ok(())
+    }
+    
+    fn hide_workspace(&self, workspace: usize) -> Result<(), WmError> {
+        let screen = self.xserver.screen_geometry();
+        let offscreen_x = -(i32::from(screen.width) * 2);
 
-            let values = ConfigureWindowAux::new()
-                .x(x as i32)
-                .y((outer + self.reserved_top) as i32)
-                .width(inner_w)
-                .height(inner_h)
-                .border_width(border);
-
-            self.xserver.configure_window(
-                client.window,
-                &values,
+        for client in self.workspaces[workspace].clients() {
+            self.xserver.move_window(
+                client.window(),
+                offscreen_x,
+                i32::from(client.geometry().y),
             )?;
-
-            x += this_w + inner;
         }
 
         Ok(())
     }
 
+    fn show_workspace(&self, workspace: usize) -> Result<(), WmError> {
+        for client in self.workspaces[workspace].clients() {
+            let geometry = client.geometry();
+
+            self.xserver.move_window(
+                client.window(),
+                i32::from(geometry.x),
+                i32::from(geometry.y),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn manage_dock(&mut self, window: Window) -> Result<(), WmError> {
+        let strut = self.xserver.dock_strut(window)?;
+
+        self.dock_window = Some(window);
+        self.reserved_top = strut;
+
+        self.xserver.map_window(window)?;
+        self.arrange()?;
+
+        Ok(())
+    }
+
+    fn find_direction_target(&self, direction: Direction) -> Option<Window> {
+        let current_window = match self.focused_workspace().focused_client() {
+            Some(window) => window,
+            None => return None,
+        };
+
+        let current_geometry = match self
+            .focused_workspace()
+            .client(current_window)
+        {
+            Some(client) => client.geometry(),
+            None => return None,
+        };
+
+        let current_left = i32::from(current_geometry.x);
+        let current_top = i32::from(current_geometry.y);
+
+        let current_right =
+            current_left + i32::from(current_geometry.width);
+
+        let current_bottom =
+            current_top + i32::from(current_geometry.height);
+
+        let current_center_x =
+            current_left + i32::from(current_geometry.width) / 2;
+
+        let current_center_y =
+            current_top + i32::from(current_geometry.height) / 2;
+
+        let master_window = match self.focused_workspace().layout() {
+            Layout::MasterStack => {
+                let mut master = None;
+
+                for client in self.focused_workspace().clients() {
+                    if client.is_floating() {
+                        continue;
+                    }
+
+                    master = Some(client.window());
+                    break;
+                }
+
+                master
+            }
+
+            _ => None,
+        };
+
+        if master_window == Some(current_window) {
+            match direction {
+                Direction::Up | Direction::Down => {
+                    return None;
+                }
+
+                Direction::Left | Direction::Right => {
+                    let mut target = None;
+                    let mut target_top = i32::MAX;
+
+                    for client in self.focused_workspace().clients() {
+                        if client.is_floating() {
+                            continue;
+                        }
+
+                        let window = client.window();
+
+                        if Some(window) == master_window {
+                            continue;
+                        }
+
+                        let geometry = client.geometry();
+                        let top = i32::from(geometry.y);
+
+                        if top < target_top {
+                            target_top = top;
+                            target = Some(window);
+                        }
+                    }
+
+                    return target;
+                }
+            }
+        }
+
+        let mut target = None;
+
+        let mut best_primary_distance = i32::MAX;
+        let mut best_overlap = 0;
+        let mut best_secondary_distance = i32::MAX;
+        let mut best_position = i32::MAX;
+
+        for client in self.focused_workspace().clients() {
+            if client.is_floating() {
+                continue;
+            }
+
+            let window = client.window();
+
+            if window == current_window {
+                continue;
+            }
+
+            let geometry = client.geometry();
+
+            let left = i32::from(geometry.x);
+            let top = i32::from(geometry.y);
+
+            let right =
+                left + i32::from(geometry.width);
+
+            let bottom =
+                top + i32::from(geometry.height);
+
+            let center_x =
+                left + i32::from(geometry.width) / 2;
+
+            let center_y =
+                top + i32::from(geometry.height) / 2;
+
+            let primary_distance;
+            let overlap;
+            let secondary_distance;
+            let position;
+
+            match direction {
+                Direction::Left => {
+                    if right > current_left {
+                        continue;
+                    }
+
+                    primary_distance = current_left - right;
+
+                    overlap = Self::range_overlap(
+                        top,
+                        bottom,
+                        current_top,
+                        current_bottom,
+                    );
+
+                    secondary_distance =
+                    (current_center_y - center_y).abs();
+
+                    position = top;
+                }
+
+                Direction::Right => {
+                    if left < current_right {
+                        continue;
+                    }
+
+                    primary_distance = left - current_right;
+
+                    overlap = Self::range_overlap(
+                        top,
+                        bottom,
+                        current_top,
+                        current_bottom,
+                    );
+
+                    secondary_distance =
+                    (current_center_y - center_y).abs();
+
+                    position = top;
+                }
+
+                Direction::Up => {
+                    if bottom > current_top {
+                        continue;
+                    }
+
+                    primary_distance = current_top - bottom;
+
+                    overlap = Self::range_overlap(
+                        left,
+                        right,
+                        current_left,
+                        current_right,
+                    );
+
+                    secondary_distance =
+                    (current_center_x - center_x).abs();
+
+                    position = left;
+                }
+
+                Direction::Down => {
+                    if top < current_bottom {
+                        continue;
+                    }
+
+                    primary_distance = top - current_bottom;
+
+                    overlap = Self::range_overlap(
+                        left,
+                        right,
+                        current_left,
+                        current_right,
+                    );
+
+                    secondary_distance =
+                    (current_center_x - center_x).abs();
+
+                    position = left;
+                }
+            }
+
+            let better = if target.is_none() {
+                true
+            } else if primary_distance < best_primary_distance {
+                true
+            } else if primary_distance > best_primary_distance {
+                false
+            } else if overlap > best_overlap {
+                true
+            } else if overlap < best_overlap {
+                false
+            } else if secondary_distance < best_secondary_distance {
+                true
+            } else if secondary_distance > best_secondary_distance {
+                false
+            } else {
+                position < best_position
+            };
+
+            if better {
+                target = Some(window);
+                best_primary_distance = primary_distance;
+                best_overlap = overlap;
+                best_secondary_distance = secondary_distance;
+                best_position = position;
+            }
+        }
+
+        if target.is_none() {
+            let screen = self.xserver.screen_geometry();
+
+            let screen_left = i32::from(screen.x);
+            let screen_top = i32::from(screen.y);
+
+            let screen_right =
+                screen_left + i32::from(screen.width);
+
+            let screen_bottom =
+                screen_top + i32::from(screen.height);
+
+            let mut best_edge_distance = i32::MAX;
+            let mut best_secondary_distance = i32::MAX;
+            let mut best_position = i32::MAX;
+
+            for client in self.focused_workspace().clients() {
+                if client.is_floating() {
+                    continue;
+                }
+
+                let window = client.window();
+
+                if window == current_window {
+                    continue;
+                }
+
+                let geometry = client.geometry();
+
+                let left = i32::from(geometry.x);
+                let top = i32::from(geometry.y);
+
+                let right =
+                    left + i32::from(geometry.width);
+
+                let bottom =
+                    top + i32::from(geometry.height);
+
+                let center_x =
+                    left + i32::from(geometry.width) / 2;
+
+                let center_y =
+                    top + i32::from(geometry.height) / 2;
+
+                let edge_distance;
+                let secondary_distance;
+                let position;
+
+                match direction {
+                    Direction::Left => {
+                        edge_distance = screen_right - right;
+
+                        secondary_distance =
+                        (current_center_y - center_y).abs();
+
+                        position = right;
+                    }
+
+                    Direction::Right => {
+                        edge_distance = left - screen_left;
+
+                        secondary_distance =
+                        (current_center_y - center_y).abs();
+
+                        position = left;
+                    }
+
+                    Direction::Up => {
+                        edge_distance = screen_bottom - bottom;
+
+                        secondary_distance =
+                        (current_center_x - center_x).abs();
+
+                        position = bottom;
+                    }
+
+                    Direction::Down => {
+                        edge_distance = top - screen_top;
+
+                        secondary_distance =
+                        (current_center_x - center_x).abs();
+
+                        position = top;
+                    }
+                }
+
+                let better = if target.is_none() {
+                    true
+                } else if edge_distance < best_edge_distance {
+                    true
+                } else if edge_distance > best_edge_distance {
+                    false
+                } else if secondary_distance < best_secondary_distance {
+                    true
+                } else if secondary_distance > best_secondary_distance {
+                    false
+                } else {
+                    position < best_position
+                };
+
+                if better {
+                    target = Some(window);
+                    best_edge_distance = edge_distance;
+                    best_secondary_distance = secondary_distance;
+                    best_position = position;
+                }
+            }
+        }
+
+        target
+    }
+
+    fn range_overlap(first_start: i32, first_end: i32, second_start: i32, second_end: i32) -> i32 {
+        let start = first_start.max(second_start);
+        let end = first_end.min(second_end);
+
+        if end > start {
+            end - start
+        } else {
+            0
+        }
+    }
+
+    fn focus_direction(&mut self, direction: Direction) -> Result<(), WmError> {
+        let target = self.find_direction_target(direction);
+
+        match target {
+            Some(window) => {
+                self.focus_client(window, None)?;
+            }
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    fn swap_direction(&mut self, direction: Direction) -> Result<(), WmError> {
+        let current_window = match self.focused_workspace().focused_client() {
+            Some(window) => window,
+            None => return Ok(()),
+        };
+
+        let target_window = match self.find_direction_target(direction) {
+            Some(window) => window,
+            None => return Ok(()),
+        };
+
+        if current_window == target_window {
+            return Ok(());
+        }
+
+        {
+            let workspace = self.focused_workspace_mut();
+
+            let current_index = match workspace
+                .clients()
+                .iter()
+                .position(|client| client.window() == current_window)
+        {
+            Some(index) => index,
+            None => return Ok(()),
+        };
+
+            let target_index = match workspace
+                .clients()
+                .iter()
+                .position(|client| client.window() == target_window)
+        {
+            Some(index) => index,
+            None => return Ok(()),
+        };
+
+            workspace
+                .clients_mut()
+                .swap(current_index, target_index);
+        }
+
+        self.ignore_enter_notify = true;
+
+        self.arrange()?;
+
+        self.focus_client(current_window, None)?;
+
+        Ok(())
+    }
+
+    fn move_to_workspace(&mut self, workspace: usize) -> Result<(), WmError> {
+        if workspace >= self.workspaces.len() {
+            return Ok(());
+        }
+
+        let current_workspace = self.focused_workspace;
+
+        if workspace == current_workspace {
+            return Ok(());
+        }
+
+        let window = match self
+            .focused_workspace()
+            .focused_client()
+        {
+            Some(window) => window,
+            None => return Ok(()),
+        };
+
+        let client = match self
+            .focused_workspace_mut()
+            .take_client(window)
+        {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        self.workspaces[workspace].add_client(client);
+
+        self.hide_window(window)?;
+
+        self.arrange()?;
+
+        let next_window = match self
+            .focused_workspace()
+            .clients()
+            .first()
+        {
+            Some(client) => client.window(),
+            None => {
+                self.xserver.set_input_focus(
+                    self.xserver.root(),
+                    None,
+                )?;
+                
+                return Ok(());
+            }
+        };
+        
+        self.focus_client(next_window, None)?;
+        
+        Ok(())
+    }
+
+    fn hide_window(&self, window: Window) -> Result<(), WmError> {
+        let screen = self.xserver.screen_geometry();
+
+        let x = -(i32::from(screen.width) * 2);
+
+        self.xserver.move_window(
+            window,
+            x,
+            0,
+        )?;
+
+        Ok(())
+    }
 }

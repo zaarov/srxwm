@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=srxwm
-Comment=An simple and rusty Xorg window manager
+Comment=Simple and Rusty Xorg Window Manager
 Exec=srxwm
 TryExec=srxwm
 Type=Application
