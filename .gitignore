@@ -1,8 +1,8 @@
 /target
 /thirdparty_configs
-wm/monitor.rs
-config/parser.rs
-config/error.rs
+src/wm/monitor.rs
+src/config/parser.rs
+src/config/error.rs
 srxwm.toml
 *~
 *#
