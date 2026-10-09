@@ -21,12 +21,12 @@ use crate::x11::XServer;
 use crate::config::{
     Config,
     Action,
+    Direction,
 };
 
 use x11rb::protocol::xproto::{
     ButtonPressEvent,
     KeyPressEvent,
-    MappingNotifyEvent,
     UnmapNotifyEvent,
     EnterNotifyEvent,
     MotionNotifyEvent,
@@ -62,13 +62,6 @@ struct MoveState {
     pointer_x: i16,
     pointer_y: i16,
     geometry: Rectangle,
-}
-
-enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
 }
 
 pub struct WindowManager {
@@ -125,10 +118,16 @@ impl WindowManager {
     }
     
     fn setup_startup_commands(config: &Config) -> Result<(), WmError> {
-        for command in config.startup_commands() {
-            Command::new(&command.program)
-                .args(&command.args)
-                .spawn()?;
+        if let Some(commands) = config.startup_commands() {
+            for command in commands {
+                let mut process: Command = std::process::Command::new(
+                    command.program()
+                );
+
+                if let Some(args) = command.args() {
+                    process.args(args);
+                }
+            }
         }
 
         Ok(())
@@ -136,12 +135,14 @@ impl WindowManager {
 
     fn setup_keybindings(wm: &WindowManager) -> Result<(), WmError> {
         for binding in wm.config.keybindings() {
-            let keycodes = wm.xserver.keycodes_for_keysym(binding.key)?;
+            let keycodes = wm
+                .xserver
+                .keycodes_for_keysym(binding.key())?;
 
             for keycode in keycodes {
                 wm.xserver.grab_key(
                     keycode,
-                    binding.modifiers,
+                    binding.modifiers(),
                 )?;
             }
         }
@@ -310,7 +311,7 @@ impl WindowManager {
         self.xserver.configure_window(
             event.window,
             geometry,
-            self.config.border(),
+            self.config.border_width(),
         )?;
 
         Ok(())
@@ -339,22 +340,22 @@ impl WindowManager {
         let event_modifiers = event.state.bits() & !u16::from(ModMask::LOCK);
 
         for binding in self.config.keybindings() {
-            let binding_modifiers = u16::from(binding.modifiers);
+            let binding_modifiers = u16::from(binding.modifiers());
 
             if event_modifiers != binding_modifiers {
                 continue;
             }
 
-            let keycodes = self.xserver.keycodes_for_keysym(binding.key)?;
+            let keycodes = self.xserver.keycodes_for_keysym(binding.key())?;
 
             if !keycodes.contains(&event.detail) {
                 continue;
             }
 
-            match &binding.action {
-                Action::Spawn { program, args } => {
-                    Command::new(program)
-                        .args(args)
+            match binding.action() {
+                Action::Spawn(command) => {
+                    Command::new(command.program())
+                        .args(command.args().unwrap_or(&[]))
                         .spawn()?;
                 }
 
@@ -364,28 +365,12 @@ impl WindowManager {
                     }
                 }
 
-                Action::FocusLeft => {self.focus_direction(Direction::Left)?;}
-
-                Action::FocusRight => {self.focus_direction(Direction::Right)?;}
-
-                Action::FocusUp => {self.focus_direction(Direction::Up)?;}
-
-                Action::FocusDown => {self.focus_direction(Direction::Down)?;}
-                
-                Action::SwapLeft => {
-                    self.swap_direction(Direction::Left)?;
+                Action::FocusWindow(direction) => {
+                    self.focus_direction(*direction)?;
                 }
 
-                Action::SwapRight => {
-                    self.swap_direction(Direction::Right)?;
-                }
-
-                Action::SwapUp => {
-                    self.swap_direction(Direction::Up)?;
-                }
-
-                Action::SwapDown => {
-                    self.swap_direction(Direction::Down)?;
+                Action::SwapWindow(direction) => {
+                    self.swap_direction(*direction)?;
                 }
 
                 Action::MoveToWorkspace(workspace) => {
@@ -443,10 +428,10 @@ impl WindowManager {
         let (window, pointer_x, pointer_y, geometry) =
             match self.moving.as_ref() {
                 Some(state) => (
-                state.window,
-                state.pointer_x,
-                state.pointer_y,
-                state.geometry,
+                    state.window,
+                    state.pointer_x,
+                    state.pointer_y,
+                    state.geometry,
                 ),
                 None => return Ok(()),
             };
@@ -469,7 +454,7 @@ impl WindowManager {
         self.xserver.configure_window(
             window,
             geometry,
-            self.config.border(),
+            self.config.border_width(),
         )?;
 
         Ok(())
@@ -536,7 +521,7 @@ impl WindowManager {
         let screen: Rectangle = self.xserver.screen_geometry();
 
         let gap: u32 = self.config.gaps();
-        let border: u32 = self.config.border();
+        let border: u32 = self.config.border_width();
 
         let screen_x: i32 = i32::from(screen.x);
         let screen_y: i32 = i32::from(screen.y) + self.reserved_top as i32;
@@ -591,7 +576,7 @@ impl WindowManager {
             .saturating_sub(horizontal_overhead);
 
         let master_width = usable_width
-            .saturating_mul(self.config.master_width())
+            .saturating_mul(self.config.master_ratio())
             / 100;
 
         let stack_width = usable_width
@@ -646,9 +631,9 @@ impl WindowManager {
 
             let y = master_y
                 + index as i32
-                    * (base_height
-                        + border.saturating_mul(2)
-                        + gap) as i32;
+                * (base_height
+                   + border.saturating_mul(2)
+                   + gap) as i32;
 
             let height = if index == stack_count - 1 {
                 base_height + remainder
@@ -717,7 +702,7 @@ impl WindowManager {
         self.xserver.configure_window(
             window,
             geometry,
-            self.config.border(),
+            self.config.border_width(),
         )?;
 
         Ok(())
@@ -749,7 +734,7 @@ impl WindowManager {
             if let Some(previous) = previous {
                 self.xserver.set_border_color(
                     previous,
-                    self.config.unfocused_border(),
+                    self.config.unfocused_border_color(),
                 )?;
             }
 
@@ -759,7 +744,7 @@ impl WindowManager {
 
         self.xserver.set_border_color(
             window,
-            self.config.focused_border(),
+            self.config.focused_border_color(),
         )?;
 
         self.xserver.set_input_focus(window, time)?;
@@ -782,7 +767,7 @@ impl WindowManager {
             Some(window) => {
                 self.xserver.set_border_color(
                     window,
-                    self.config.unfocused_border(),
+                    self.config.unfocused_border_color(),
                 )?;
             }
             None => {}
@@ -1003,7 +988,7 @@ impl WindowManager {
                     );
 
                     secondary_distance =
-                    (current_center_y - center_y).abs();
+                        (current_center_y - center_y).abs();
 
                     position = top;
                 }
@@ -1023,7 +1008,7 @@ impl WindowManager {
                     );
 
                     secondary_distance =
-                    (current_center_y - center_y).abs();
+                        (current_center_y - center_y).abs();
 
                     position = top;
                 }
@@ -1043,7 +1028,7 @@ impl WindowManager {
                     );
 
                     secondary_distance =
-                    (current_center_x - center_x).abs();
+                        (current_center_x - center_x).abs();
 
                     position = left;
                 }
@@ -1063,7 +1048,7 @@ impl WindowManager {
                     );
 
                     secondary_distance =
-                    (current_center_x - center_x).abs();
+                        (current_center_x - center_x).abs();
 
                     position = left;
                 }
@@ -1149,7 +1134,7 @@ impl WindowManager {
                         edge_distance = screen_right - right;
 
                         secondary_distance =
-                        (current_center_y - center_y).abs();
+                            (current_center_y - center_y).abs();
 
                         position = right;
                     }
@@ -1158,7 +1143,7 @@ impl WindowManager {
                         edge_distance = left - screen_left;
 
                         secondary_distance =
-                        (current_center_y - center_y).abs();
+                            (current_center_y - center_y).abs();
 
                         position = left;
                     }
@@ -1167,7 +1152,7 @@ impl WindowManager {
                         edge_distance = screen_bottom - bottom;
 
                         secondary_distance =
-                        (current_center_x - center_x).abs();
+                            (current_center_x - center_x).abs();
 
                         position = bottom;
                     }
@@ -1176,7 +1161,7 @@ impl WindowManager {
                         edge_distance = top - screen_top;
 
                         secondary_distance =
-                        (current_center_x - center_x).abs();
+                            (current_center_x - center_x).abs();
 
                         position = top;
                     }
@@ -1254,19 +1239,19 @@ impl WindowManager {
                 .clients()
                 .iter()
                 .position(|client| client.window() == current_window)
-        {
-            Some(index) => index,
-            None => return Ok(()),
-        };
+            {
+                Some(index) => index,
+                None => return Ok(()),
+            };
 
             let target_index = match workspace
                 .clients()
                 .iter()
                 .position(|client| client.window() == target_window)
-        {
-            Some(index) => index,
-            None => return Ok(()),
-        };
+            {
+                Some(index) => index,
+                None => return Ok(()),
+            };
 
             workspace
                 .clients_mut()
