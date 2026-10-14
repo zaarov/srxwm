@@ -1,50 +1,40 @@
-mod error;
 mod client;
+mod error;
+mod layout;
+mod workarea;
 mod workspace;
 
-// TODO: add multiple monitor support
-// mod monitor;
-
-pub use error::WmError;
 pub use client::Client;
-pub use workspace::{
-    Workspace,
-    Layout,
-};
+pub use error::WmError;
+pub use workspace::{Layout, Workspace};
 
-// TODO: add multiple monitor support
-// pub use monitor::Monitor;
+use std::cmp::Reverse;
+use std::collections::HashMap;
+use std::process::Command as ProcessCommand;
 
-use std::process::Command;
-
-use crate::x11::XServer;
-use crate::config::{
-    Config,
-    Action,
-    Direction,
-};
-
+use crate::config::{Action, Config, Direction};
+use crate::x11::{DockStrut, XServer};
+use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
+    ButtonIndex,
     ButtonPressEvent,
-    KeyPressEvent,
-    UnmapNotifyEvent,
+    ButtonReleaseEvent,
+    ClientMessageEvent,
+    ConfigWindow,
+    ConfigureRequestEvent,
     EnterNotifyEvent,
+    KeyPressEvent,
+    ModMask,
     MotionNotifyEvent,
+    NotifyDetail,
+    NotifyMode,
+    PropertyNotifyEvent,
     Rectangle,
     Timestamp,
     Window,
-    ConfigureRequestEvent,
-    ConfigWindow,
-    ModMask,
-    KeyButMask,
-    NotifyMode,
-    NotifyDetail,
-    ButtonIndex,
 };
-use x11rb::protocol::Event;
 
 const WORKSPACE_COUNT: usize = 9;
-
 const WORKSPACE_NAMES: &[u8] = &[
     b'1', 0,
     b'2', 0,
@@ -57,6 +47,7 @@ const WORKSPACE_NAMES: &[u8] = &[
     b'9', 0,
 ];
 
+#[derive(Clone, Copy)]
 struct MoveState {
     window: Window,
     pointer_x: i16,
@@ -69,226 +60,207 @@ pub struct WindowManager {
     workspaces: Vec<Workspace>,
     focused_workspace: usize,
     config: Config,
-    dock_window: Option<Window>,
-    reserved_top: u32,
-    ignore_enter_notify: bool,
+    docks: HashMap<Window, DockStrut>,
     moving: Option<MoveState>,
-    // TODO: add multiple monitor support
-    // monitors: Vec<Monitor>,
-    // focused_monitor: usize,
+    ignore_enter_notify: bool,
+    keycodes_by_keysym: HashMap<u32, Vec<u8>>,
+    grabbed_key_combinations: Vec<(u8, ModMask)>,
 }
 
 impl WindowManager {
     pub fn new() -> Result<Self, WmError> {
-        let xserver: XServer = XServer::connect()?;
-        let mut workspaces: Vec<Workspace> = Vec::with_capacity(WORKSPACE_COUNT);
+        let xserver = XServer::connect()?;
+        let workspaces = (0..WORKSPACE_COUNT).map(|_| Workspace::new()).collect();
+        let config = Config::default();
 
-        for _ in 0..WORKSPACE_COUNT {
-            workspaces.push(Workspace::new());
-        }
-        
-        let wm: WindowManager = Self {
+        let mut wm = Self {
             xserver,
             workspaces,
             focused_workspace: 0,
-            config: Config::default(),
-            dock_window: None,
-            reserved_top: 0,
-            ignore_enter_notify: false,
+            config,
+            docks: HashMap::new(),
             moving: None,
-
-            // TODO: add multiple monitor support
-            // monitors: Vec::new(),
-            // focused_monitor: 0,
+            ignore_enter_notify: false,
+            keycodes_by_keysym: HashMap::new(),
+            grabbed_key_combinations: Vec::new(),
         };
 
         wm.xserver.claim_wm()?;
         wm.xserver.setup_wm_check()?;
         wm.xserver.setup_net_supported()?;
-        wm.xserver.setup_desktops(
-            WORKSPACE_COUNT,
-            WORKSPACE_NAMES,
-        )?;
+        wm.xserver
+            .setup_desktops(WORKSPACE_COUNT, WORKSPACE_NAMES)?;
+        wm.xserver.update_current_workspace(0)?;
         wm.xserver.set_normal_cursor(wm.xserver.root())?;
-        
+        wm.setup_keybindings()?;
+        wm.update_workarea_property()?;
         Self::setup_startup_commands(&wm.config)?;
-        Self::setup_keybindings(&wm)?;
-        
+
         Ok(wm)
     }
-    
+
     fn setup_startup_commands(config: &Config) -> Result<(), WmError> {
         if let Some(commands) = config.startup_commands() {
             for command in commands {
-                let mut process: Command = std::process::Command::new(
-                    command.program()
-                );
+                ProcessCommand::new(command.program())
+                    .args(command.args().unwrap_or(&[]))
+                    .spawn()?;
+            }
+        }
+        Ok(())
+    }
 
-                if let Some(args) = command.args() {
-                    process.args(args);
+    fn setup_keybindings(&mut self) -> Result<(), WmError> {
+        for (keycode, modifiers) in std::mem::take(&mut self.grabbed_key_combinations) {
+            self.xserver.ungrab_key(keycode, modifiers)?;
+        }
+
+        let mut keycodes_by_keysym: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut grabbed = std::collections::HashSet::new();
+        let mut grabbed_combinations = Vec::new();
+
+        for binding in self.config.keybindings() {
+            let key = binding.key();
+            let keysym = key.raw();
+            let modifiers = binding.modifiers();
+
+            if !keycodes_by_keysym.contains_key(&keysym) {
+                let keycodes = self.xserver.keycodes_for_keysym(key)?;
+                keycodes_by_keysym.insert(keysym, keycodes);
+            }
+
+            let keycodes = keycodes_by_keysym
+                .get(&keysym)
+                .expect("keycodes are inserted before being read");
+            for &keycode in keycodes {
+                if grabbed.insert((keycode, modifiers.bits())) {
+                    self.xserver.grab_key(keycode, modifiers)?;
+                    grabbed_combinations.push((keycode, modifiers));
                 }
             }
         }
 
+        self.keycodes_by_keysym = keycodes_by_keysym;
+        self.grabbed_key_combinations = grabbed_combinations;
         Ok(())
     }
 
-    fn setup_keybindings(wm: &WindowManager) -> Result<(), WmError> {
-        for binding in wm.config.keybindings() {
-            let keycodes = wm
-                .xserver
-                .keycodes_for_keysym(binding.key())?;
-
-            for keycode in keycodes {
-                wm.xserver.grab_key(
-                    keycode,
-                    binding.modifiers(),
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-    
     pub fn run(&mut self) -> Result<(), WmError> {
         loop {
-            let event: Event = self.xserver.wait_for_event()?;
-            self.hdl_event(event)?;
+            let event = self.xserver.wait_for_event()?;
+            self.handle_event(event)?;
         }
     }
 
-    fn hdl_event(&mut self, event: Event) -> Result<(), WmError> {
+    fn handle_event(&mut self, event: Event) -> Result<(), WmError> {
         let sent_event = event.sent_event();
-        
         match event {
-            Event::MapRequest(e) => self.hdl_map_request(e.window)?,
-            Event::UnmapNotify(e) => self.hdl_unmap_notify(e, sent_event)?,
-            Event::DestroyNotify(e) => self.hdl_destroy_notify(e.window)?,
-            Event::ConfigureRequest(e) => self.hdl_configure_request(e)?,
-            Event::EnterNotify(e) => self.hdl_enter_notify(e)?,
-            Event::KeyPress(e) => self.hdl_key_press(e)?,
-            Event::ButtonPress(e) => self.hdl_button_press(e)?,
-            Event::MotionNotify(e) => self.hdl_motion_notify(e)?,
-            Event::ButtonRelease(e) => self.hdl_button_release(e)?,
-            _ => {},
+            Event::MapRequest(event) => self.handle_map_request(event.window)?,
+            Event::UnmapNotify(event) => self.handle_unmap_notify(event.window, sent_event)?,
+            Event::DestroyNotify(event) => self.handle_destroy_notify(event.window)?,
+            Event::ConfigureRequest(event) => self.handle_configure_request(event)?,
+            Event::EnterNotify(event) => self.handle_enter_notify(event)?,
+            Event::PropertyNotify(event) => self.handle_property_notify(event)?,
+            Event::MappingNotify(_) => self.setup_keybindings()?,
+            Event::KeyPress(event) => self.handle_key_press(event)?,
+            Event::ButtonPress(event) => self.handle_button_press(event)?,
+            Event::MotionNotify(event) => self.handle_motion_notify(event)?,
+            Event::ButtonRelease(event) => self.handle_button_release(event)?,
+            Event::ClientMessage(event) => self.hdl_client_message(event)?,
+            _ => {}
         }
-        
         self.xserver.flush()?;
-        
         Ok(())
     }
 
-    fn hdl_map_request(&mut self, window: Window) -> Result<(), WmError> {
-        if self.focused_workspace().client(window).is_some() {
+    fn handle_map_request(&mut self, window: Window) -> Result<(), WmError> {
+        if self.workspace_index_for(window).is_some() {
             return Ok(());
         }
 
         self.xserver.select_window_events(window)?;
-
         if self.xserver.is_dock_window(window)? {
-            self.manage_dock(window)?;
-            return Ok(());
+            return self.manage_dock(window);
         }
 
         let geometry = self.xserver.window_geometry(window)?;
         let floating = self.xserver.should_float(window)?;
-
         let mut client = Client::new(window, geometry);
         client.set_floating(floating);
-
-        if floating {
-            self.xserver.grab_button(
-                window,
-                ButtonIndex::M1,
-                ModMask::M1,
-            )?;
-        }
-
         self.focused_workspace_mut().add_client(client);
 
-        self.arrange()?;
+        if floating {
+            self.xserver
+                .grab_button(window, ButtonIndex::M1, self.config.mod_key())?;
+        }
 
         self.xserver.map_window(window)?;
+        if let Some(client) = self.focused_workspace_mut().client_mut(window) {
+            client.set_mapped(true);
+        }
+        self.arrange()?;
         self.focus_client(window, None)?;
-
         Ok(())
     }
-    
-    fn hdl_unmap_notify(&mut self, event: UnmapNotifyEvent, sent_event: bool) -> Result<(), WmError> {
+
+    fn handle_unmap_notify(&mut self, window: Window, sent_event: bool) -> Result<(), WmError> {
         if sent_event {
             return Ok(());
         }
-
-        let was_focused =
-            self.focused_workspace().focused_client() == Some(event.window);
-
-        self.focused_workspace_mut()
-            .remove_client(event.window);
-
-        self.arrange()?;
-
-        if was_focused {
-            self.focused_workspace_mut()
-                .clear_focused_client();
-
-            if let Some(next) = self
-                .focused_workspace()
-                .clients()
-                .first()
-                .map(Client::window)
-            {
-                self.focus_client(next, None)?;
-            }
-        }
-
-        Ok(())
-    }
-    
-    fn hdl_destroy_notify(&mut self, window: Window) -> Result<(), WmError> {
-        let was_focused =
-            self.focused_workspace().focused_client() == Some(window);
-
-        self.focused_workspace_mut().remove_client(window);
-
-        self.arrange()?;
-
-        if was_focused {
-            self.focused_workspace_mut()
-                .clear_focused_client();
-
-            if let Some(next) = self
-                .focused_workspace()
-                .clients()
-                .iter()
-                .find(|client| client.is_mapped())
-                .map(Client::window)
-            {
-                self.focus_client(next, None)?;
-            }
-        }
-
-        Ok(())
+        self.remove_window(window)
     }
 
-    // TODO: refactor this
-    fn hdl_configure_request(&mut self, event: ConfigureRequestEvent) -> Result<(), WmError> {
-        let floating = match self.focused_workspace().client(event.window) {
-            Some(client) => client.is_floating(),
-            None => {
-                self.xserver.configure_window_request(&event)?;
-                return Ok(());
-            }
-        };
+    fn handle_destroy_notify(&mut self, window: Window) -> Result<(), WmError> {
+        self.remove_window(window)
+    }
 
-        if !floating {
+    fn remove_window(&mut self, window: Window) -> Result<(), WmError> {
+        if self.moving.is_some_and(|moving| moving.window == window) {
+            self.cancel_move()?;
+        }
+
+        if self.docks.remove(&window).is_some() {
+            self.update_workarea_property()?;
             self.arrange()?;
             return Ok(());
         }
 
-        let mut geometry = match self.focused_workspace().client(event.window) {
-            Some(client) => client.geometry(),
-            None => return Ok(()),
+        let Some(workspace_index) = self.workspace_index_for(window) else {
+            return Ok(());
         };
+        
+        let was_focused = self.workspaces[workspace_index].focused_client() == Some(window);
+        self.workspaces[workspace_index].take_client(window);
+
+        if workspace_index != self.focused_workspace {
+            return Ok(());
+        }
+
+        self.arrange()?;
+        if was_focused {
+            self.focus_fallback(None)?;
+        }
+        Ok(())
+    }
+
+    fn handle_configure_request(&mut self, event: ConfigureRequestEvent) -> Result<(), WmError> {
+        let Some(workspace_index) = self.workspace_index_for(event.window) else {
+            self.xserver.configure_window_request(&event)?;
+            return Ok(());
+        };
+
+        let Some(client) = self.workspaces[workspace_index].client(event.window) else {
+            return Ok(());
+        };
+
+        if !client.is_floating() {
+            if workspace_index == self.focused_workspace {
+                self.arrange()?;
+            }
+            return Ok(());
+        }
+
+        let mut geometry = client.geometry();
 
         if event.value_mask.contains(ConfigWindow::X) {
             geometry.x = event.x;
@@ -299,119 +271,114 @@ impl WindowManager {
         }
 
         if event.value_mask.contains(ConfigWindow::WIDTH) {
-            geometry.width = event.width;
+            geometry.width = event.width.max(1);
         }
 
         if event.value_mask.contains(ConfigWindow::HEIGHT) {
-            geometry.height = event.height;
+            geometry.height = event.height.max(1);
         }
 
-        self.set_client_geometry(event.window, geometry);
+        if let Some(client) = self.workspaces[workspace_index].client_mut(event.window) {
+            client.set_geometry(geometry);
+        }
 
-        self.xserver.configure_window(
-            event.window,
-            geometry,
-            self.config.border_width(),
-        )?;
-
+        if workspace_index == self.focused_workspace {
+            self.xserver
+                .configure_window(event.window, geometry, self.config.border_width())?;
+        }
         Ok(())
     }
-    
-    fn hdl_enter_notify(&mut self, event: EnterNotifyEvent) -> Result<(), WmError> {
+
+    fn handle_property_notify(&mut self, event: PropertyNotifyEvent) -> Result<(), WmError> {
+        if !self.docks.contains_key(&event.window) {
+            return Ok(());
+        }
+
+        let atoms = self.xserver.atoms();
+        if event.atom != atoms.NetWmStrutPartial && event.atom != atoms.NetWmStrut {
+            return Ok(());
+        }
+
+        let strut = self.xserver.dock_strut(event.window)?;
+        self.docks.insert(event.window, strut);
+        self.update_workarea_property()?;
+        self.arrange()?;
+        Ok(())
+    }
+
+    fn handle_enter_notify(&mut self, event: EnterNotifyEvent) -> Result<(), WmError> {
         if self.ignore_enter_notify {
             self.ignore_enter_notify = false;
             return Ok(());
         }
 
-        if event.mode != NotifyMode::NORMAL {
+        if event.mode != NotifyMode::NORMAL || event.detail == NotifyDetail::INFERIOR {
             return Ok(());
         }
 
-        if event.detail == NotifyDetail::INFERIOR {
-            return Ok(());
-        }
-
-        self.focus_client(event.event, Some(event.time))?;
-
-        Ok(())
+        self.focus_client(event.event, Some(event.time))
     }
 
-    fn hdl_key_press(&mut self, event: KeyPressEvent) -> Result<(), WmError> {
-        let event_modifiers = event.state.bits() & !u16::from(ModMask::LOCK);
+    fn handle_key_press(&mut self, event: KeyPressEvent) -> Result<(), WmError> {
+        let state = event.state.bits() & !x11rb::protocol::xproto::ModMask::LOCK.bits();
 
         for binding in self.config.keybindings() {
-            let binding_modifiers = u16::from(binding.modifiers());
-
-            if event_modifiers != binding_modifiers {
+            if state != binding.modifiers().bits() {
                 continue;
             }
 
-            let keycodes = self.xserver.keycodes_for_keysym(binding.key())?;
-
-            if !keycodes.contains(&event.detail) {
+            let keysym = binding.key().raw();
+            let matches_keycode = self
+                .keycodes_by_keysym
+                .get(&keysym)
+                .is_some_and(|keycodes| keycodes.contains(&event.detail));
+            if !matches_keycode {
                 continue;
             }
 
             match binding.action() {
                 Action::Spawn(command) => {
-                    Command::new(command.program())
+                    ProcessCommand::new(command.program())
                         .args(command.args().unwrap_or(&[]))
                         .spawn()?;
                 }
-
                 Action::CloseWindow => {
                     if let Some(window) = self.focused_workspace().focused_client() {
                         self.xserver.close_window(window, event.time)?;
                     }
                 }
-
-                Action::FocusWindow(direction) => {
-                    self.focus_direction(*direction)?;
-                }
-
-                Action::SwapWindow(direction) => {
-                    self.swap_direction(*direction)?;
-                }
-
-                Action::MoveToWorkspace(workspace) => {
-                    self.move_to_workspace(*workspace)?;
-                }
-
-                Action::SwitchWorkspace(workspace) => {
-                    self.switch_workspace(*workspace)?;
-                }
+                Action::FocusWindow(direction) => self.focus_direction(*direction)?,
+                Action::SwapWindow(direction) => self.swap_direction(*direction)?,
+                Action::MoveToWorkspace(workspace) => self.move_to_workspace(*workspace)?,
+                Action::SwitchWorkspace(workspace) => self.switch_workspace(*workspace)?,
+                Action::ToggleFullscreen => self.toggle_fullscreen()?,
             }
-
             break;
         }
 
         Ok(())
     }
 
-    fn hdl_button_press(&mut self, event: ButtonPressEvent) -> Result<(), WmError> {
+    fn handle_button_press(&mut self, event: ButtonPressEvent) -> Result<(), WmError> {
         if event.detail != u8::from(ButtonIndex::M1) {
             return Ok(());
         }
-
-        if !event.state.contains(KeyButMask::MOD1) {
+        let configured_modifier = self.config.mod_key().bits();
+        if event.state.bits() & configured_modifier != configured_modifier {
             return Ok(());
         }
 
         let window = event.event;
-
-        let geometry = match self.focused_workspace().client(window) {
-            Some(client) => {
-                if !client.is_floating() {
-                    return Ok(());
-                }
-
-                client.geometry()
-            }
-            None => return Ok(()),
+        let Some(client) = self.focused_workspace().client(window) else {
+            return Ok(());
         };
+        if !client.is_floating() || !client.is_mapped() {
+            return Ok(());
+        }
+        let geometry = client.geometry();
 
         self.focus_client(window, Some(event.time))?;
-
+        self.xserver.grab_pointer_move()?;
         self.moving = Some(MoveState {
             window,
             pointer_x: event.root_x,
@@ -419,296 +386,249 @@ impl WindowManager {
             geometry,
         });
 
-        self.xserver.grab_pointer_move()?;
-
         Ok(())
     }
-    
-    fn hdl_motion_notify(&mut self, event: MotionNotifyEvent) -> Result<(), WmError> {
-        let (window, pointer_x, pointer_y, geometry) =
-            match self.moving.as_ref() {
-                Some(state) => (
-                    state.window,
-                    state.pointer_x,
-                    state.pointer_y,
-                    state.geometry,
-                ),
-                None => return Ok(()),
-            };
 
-        let delta_x =
-            i32::from(event.root_x) - i32::from(pointer_x);
-
-        let delta_y =
-            i32::from(event.root_y) - i32::from(pointer_y);
-
+    fn handle_motion_notify(&mut self, event: MotionNotifyEvent) -> Result<(), WmError> {
+        let Some(state) = self.moving else {
+            return Ok(());
+        };
+        let dx = i32::from(event.root_x) - i32::from(state.pointer_x);
+        let dy = i32::from(event.root_y) - i32::from(state.pointer_y);
         let geometry = Rectangle {
-            x: (i32::from(geometry.x) + delta_x) as i16,
-            y: (i32::from(geometry.y) + delta_y) as i16,
-            width: geometry.width,
-            height: geometry.height,
+            x: clamp_i16(i32::from(state.geometry.x) + dx),
+            y: clamp_i16(i32::from(state.geometry.y) + dy),
+            width: state.geometry.width.max(1),
+            height: state.geometry.height.max(1),
         };
 
-        self.set_client_geometry(window, geometry);
-
-        self.xserver.configure_window(
-            window,
-            geometry,
-            self.config.border_width(),
-        )?;
-
+        if let Some(client) = self.focused_workspace_mut().client_mut(state.window) {
+            client.set_geometry(geometry);
+        } else {
+            return Ok(());
+        }
+        self.xserver
+            .configure_window(state.window, geometry, self.config.border_width())?;
         Ok(())
     }
-    
-    fn hdl_button_release(&mut self, event: ButtonPressEvent) -> Result<(), WmError> {
-        if event.detail != u8::from(ButtonIndex::M1) {
+
+    fn handle_button_release(&mut self, event: ButtonReleaseEvent) -> Result<(), WmError> {
+        if event.detail != u8::from(ButtonIndex::M1) || self.moving.is_none() {
             return Ok(());
         }
-
-        if self.moving.is_none() {
-            return Ok(());
-        }
-
         self.moving = None;
-
         self.xserver.ungrab_pointer()?;
-
         Ok(())
     }
-    
+
     fn arrange(&mut self) -> Result<(), WmError> {
-        let layout = self.workspaces[self.focused_workspace].layout();
+        let placements = layout::calculate(
+            self.focused_workspace().layout(),
+            self.focused_workspace().clients(),
+            self.work_area(),
+            self.config.gaps(),
+            self.config.border_width(),
+            self.config.master_ratio(),
+        );
 
-        match layout {
-            Layout::MasterStack => self.arrange_master()?,
-            Layout::Tree => self.arrange_tree()?,
-            Layout::Horizontal => self.arrange_hor()?,
-            Layout::Vertical => self.arrange_vert()?,
-            Layout::Tabbed => self.arrange_tab()?,
-            Layout::Floating => self.arrange_float()?,
+        for &(window, geometry) in &placements {
+            if let Some(client) = self.focused_workspace_mut().client_mut(window) {
+                client.set_geometry(geometry);
+            }
+        }
+
+        let fullscreen_window = self
+            .focused_workspace()
+            .clients()
+            .iter()
+            .find(|client| client.is_mapped() && client.is_fullscreen())
+            .map(Client::window);
+
+        for (window, geometry) in placements {
+            if Some(window) == fullscreen_window {
+                continue;
+            }
+
+            self.xserver
+                .configure_window(window, geometry, self.config.border_width())?;
+        }
+
+        if let Some(window) = fullscreen_window {
+            let geometry = self.xserver.screen_geometry();
+
+            self.xserver.configure_window(window, geometry, 0)?;
+            self.xserver.raise_window(window)?;
         }
 
         Ok(())
     }
 
-    // Recheck this logic later
-    fn arrange_master(&mut self) -> Result<(), WmError> {
-        let (tiled_windows, floating_windows) = {
-            let clients: &[Client] = self.focused_workspace().clients();
-
-            let mut tiled_windows: Vec<Window> = Vec::new();
-            let mut floating_windows: Vec<Window> = Vec::new();
-
-            for client in clients {   
-                if client.is_floating() {
-                    floating_windows.push(client.window());
-                } else {
-                    tiled_windows.push(client.window());
-                }
-            }
-
-            (tiled_windows, floating_windows)
-        };
-
-        for window in floating_windows {
-            self.arrange_float_win(window)?;
-        }
-
-        if tiled_windows.is_empty() {
+    fn hdl_client_message(&mut self, event: ClientMessageEvent) -> Result<(), WmError> {
+        if event.type_ != self.xserver.atoms().NetWmState {
             return Ok(());
         }
 
-        let screen: Rectangle = self.xserver.screen_geometry();
+        let data = event.data.as_data32();
+        let fullscreen_atom = self.xserver.atoms().NetWmStateFullscreen;
 
-        let gap: u32 = self.config.gaps();
-        let border: u32 = self.config.border_width();
-
-        let screen_x: i32 = i32::from(screen.x);
-        let screen_y: i32 = i32::from(screen.y) + self.reserved_top as i32;
-        let screen_width: u32 = u32::from(screen.width);
-        let screen_height: u32 = u32::from(screen.height)
-            .saturating_sub(self.reserved_top);
-
-        let clients_count: usize = tiled_windows.len();
-
-        if clients_count == 1 {
-            let window = tiled_windows[0];
-
-            let x = screen_x + gap as i32;
-            let y = screen_y + gap as i32;
-
-            let width = screen_width
-                .saturating_sub(gap.saturating_mul(2))
-                .saturating_sub(border.saturating_mul(2));
-
-            let height = screen_height
-                .saturating_sub(gap.saturating_mul(2))
-                .saturating_sub(border.saturating_mul(2));
-
-            let geometry = Rectangle {
-                x: x as i16,
-                y: y as i16,
-                width: width as u16,
-                height: height as u16,
-            };
-
-            self.set_client_geometry(window, geometry);
-
-            self.xserver.configure_window(
-                window,
-                geometry,
-                border,
-            )?;
-
+        if data[1] != fullscreen_atom && data[2] != fullscreen_atom {
             return Ok(());
         }
 
-        let outer_width = screen_width
-            .saturating_sub(gap.saturating_mul(2));
-
-        let outer_height = screen_height
-            .saturating_sub(gap.saturating_mul(2));
-
-        let horizontal_overhead = gap
-            .saturating_add(border.saturating_mul(4));
-
-        let usable_width = outer_width
-            .saturating_sub(horizontal_overhead);
-
-        let master_width = usable_width
-            .saturating_mul(self.config.master_ratio())
-            / 100;
-
-        let stack_width = usable_width
-            .saturating_sub(master_width);
-
-        let master_x = screen_x + gap as i32;
-        let master_y = screen_y + gap as i32;
-
-        let master_height = outer_height
-            .saturating_sub(border.saturating_mul(2));
-
-        let master_geometry = Rectangle {
-            x: master_x as i16,
-            y: master_y as i16,
-            width: master_width as u16,
-            height: master_height as u16,
-        };
-
-        let master_window = tiled_windows[0];
-
-        let mut geometries: Vec<(Window, Rectangle)> =
-            Vec::with_capacity(clients_count);
-
-        geometries.push((master_window, master_geometry));
-
-        let stack_count = clients_count - 1;
-
-        let stack_gap_total = gap
-            .saturating_mul((stack_count - 1) as u32);
-
-        let stack_border_total = border
-            .saturating_mul(2)
-            .saturating_mul(stack_count as u32);
-
-        let stack_content_height = outer_height
-            .saturating_sub(stack_gap_total)
-            .saturating_sub(stack_border_total);
-
-        let base_height = stack_content_height
-            / stack_count as u32;
-
-        let remainder = stack_content_height
-            % stack_count as u32;
-
-        let stack_x = master_x
-            + master_width as i32
-            + border.saturating_mul(2) as i32
-            + gap as i32;
-
-        for index in 0..stack_count {
-            let window = tiled_windows[index + 1];
-
-            let y = master_y
-                + index as i32
-                * (base_height
-                   + border.saturating_mul(2)
-                   + gap) as i32;
-
-            let height = if index == stack_count - 1 {
-                base_height + remainder
-            } else {
-                base_height
-            };
-
-            let geometry = Rectangle {
-                x: stack_x as i16,
-                y: y as i16,
-                width: stack_width as u16,
-                height: height as u16,
-            };
-
-            geometries.push((window, geometry));
-        }
-
+        let current_state = match self
+            .workspaces
+            .iter()
+            .find_map(|workspace| workspace.client(event.window).map(Client::is_fullscreen))
         {
-            let workspace = self.focused_workspace_mut();
-
-            for &(window, geometry) in &geometries {
-                if let Some(client) = workspace.client_mut(window) {
-                    client.set_geometry(geometry);
-                }
-            }
-        }
-
-        for &(window, geometry) in &geometries {
-            self.xserver.configure_window(
-                window,
-                geometry,
-                border,
-            )?;
-        }
-
-        Ok(())
-    }
-    
-    fn arrange_tree(&self) -> Result<(), WmError> {
-        todo!("impl tree tiling algorithm")
-    }
-
-    fn arrange_hor(&self) -> Result<(), WmError> {
-        todo!("impl horizontal tiling algorithm")
-    }
-
-    fn arrange_vert(&self) -> Result<(), WmError> {
-        todo!("impl vertical tiling algorithm")
-    }
-
-    fn arrange_tab(&self) -> Result<(), WmError> {
-        todo!("impl tabs tiling algorithm")
-    }
-
-    fn arrange_float(&self) -> Result<(), WmError> {
-        todo!("impl floating workspace state")
-    }
-
-    // Recheck this logic later
-    fn arrange_float_win(&mut self, window: Window) -> Result<(), WmError> {
-        let geometry = match self.focused_workspace().client(window) {
-            Some(client) => client.geometry(),
+            Some(state) => state,
             None => return Ok(()),
         };
 
-        self.xserver.configure_window(
-            window,
-            geometry,
-            self.config.border_width(),
-        )?;
+        let fullscreen = match data[0] {
+            0 => false,
+            1 => true,
+            2 => !current_state,
+            _ => return Ok(()),
+        };
 
+        self.set_client_fullscreen(event.window, fullscreen)
+    }
+
+    fn focus_client(&mut self, window: Window, time: Option<Timestamp>) -> Result<(), WmError> {
+        let Some(client) = self.focused_workspace().client(window) else {
+            return Ok(());
+        };
+        if !client.is_mapped() {
+            return Ok(());
+        }
+        let should_raise =
+            client.is_floating() || self.focused_workspace().layout() == Layout::Tabbed;
+        let previous = self.focused_workspace().focused_client();
+
+        if previous != Some(window) {
+            if let Some(previous) = previous.filter(|previous| {
+                self.focused_workspace()
+                    .client(*previous)
+                    .is_some_and(Client::is_mapped)
+            }) {
+                self.xserver
+                    .set_border_color(previous, self.config.unfocused_border_color())?;
+            }
+            self.focused_workspace_mut().set_focused_client(window);
+        }
+
+        self.xserver
+            .set_border_color(window, self.config.focused_border_color())?;
+        if should_raise {
+            self.xserver.raise_window(window)?;
+        }
+        self.xserver.set_input_focus(window, time)?;
         Ok(())
     }
 
-    // HELPERS
+    fn focus_fallback(&mut self, time: Option<Timestamp>) -> Result<(), WmError> {
+        let next = self
+            .focused_workspace()
+            .focused_client()
+            .filter(|window| {
+                self.focused_workspace()
+                    .client(*window)
+                    .is_some_and(Client::is_mapped)
+            })
+            .or_else(|| {
+                self.focused_workspace()
+                    .clients()
+                    .iter()
+                    .find(|client| client.is_mapped())
+                    .map(Client::window)
+            });
+
+        if let Some(window) = next {
+            self.focus_client(window, time)
+        } else {
+            self.focused_workspace_mut().clear_focused_client();
+            self.xserver.set_input_focus(self.xserver.root(), time)?;
+            Ok(())
+        }
+    }
+
+    fn switch_workspace(&mut self, workspace: usize) -> Result<(), WmError> {
+        if workspace >= self.workspaces.len() || workspace == self.focused_workspace {
+            return Ok(());
+        }
+        self.cancel_move()?;
+
+        let old_workspace = self.focused_workspace;
+        if let Some(window) = self.workspaces[old_workspace].focused_client() {
+            self.xserver
+                .set_border_color(window, self.config.unfocused_border_color())?;
+        }
+        self.hide_workspace(old_workspace)?;
+        self.focused_workspace = workspace;
+        self.show_workspace(workspace)?;
+        self.arrange()?;
+        self.xserver.update_current_workspace(workspace as u32)?;
+        self.focus_fallback(None)
+    }
+
+    fn hide_workspace(&self, workspace: usize) -> Result<(), WmError> {
+        let screen = self.xserver.screen_geometry();
+        let offscreen_x = -i32::from(screen.width).saturating_mul(2);
+        for client in self.workspaces[workspace]
+            .clients()
+            .iter()
+            .filter(|client| client.is_mapped())
+        {
+            self.xserver.move_window(
+                client.window(),
+                offscreen_x,
+                i32::from(client.geometry().y),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn show_workspace(&self, workspace: usize) -> Result<(), WmError> {
+        for client in self.workspaces[workspace]
+            .clients()
+            .iter()
+            .filter(|client| client.is_mapped())
+        {
+            let geometry = client.geometry();
+            self.xserver.move_window(
+                client.window(),
+                i32::from(geometry.x),
+                i32::from(geometry.y),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn manage_dock(&mut self, window: Window) -> Result<(), WmError> {
+        let strut = self.xserver.dock_strut(window)?;
+        self.docks.insert(window, strut);
+        self.xserver.map_window(window)?;
+        self.update_workarea_property()?;
+        self.arrange()?;
+        Ok(())
+    }
+
+    fn work_area(&self) -> Rectangle {
+        workarea::calculate(self.xserver.screen_geometry(), self.docks.values().copied())
+    }
+
+    fn update_workarea_property(&self) -> Result<(), WmError> {
+        self.xserver
+            .update_workarea(self.work_area(), WORKSPACE_COUNT)?;
+        Ok(())
+    }
+
+    fn workspace_index_for(&self, window: Window) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.client(window).is_some())
+    }
+
     fn focused_workspace(&self) -> &Workspace {
         &self.workspaces[self.focused_workspace]
     }
@@ -717,621 +637,365 @@ impl WindowManager {
         &mut self.workspaces[self.focused_workspace]
     }
 
-    fn set_client_geometry(&mut self, window: Window, geometry: Rectangle) {
-        if let Some(client) = self.focused_workspace_mut().client_mut(window) {
-            client.set_geometry(geometry);
-        }
-    }
+    fn find_direction_target(
+        &self,
+        direction: Direction,
+        include_floating: bool,
+    ) -> Option<Window> {
+        let workspace = self.focused_workspace();
+        let current_window = workspace.focused_client()?;
+        let current = workspace.client(current_window)?;
 
-    fn focus_client(&mut self, window: Window, time: Option<Timestamp>) -> Result<(), WmError> {
-        if self.focused_workspace().client(window).is_none() {
-            return Ok(());
-        }
-
-        let previous = self.focused_workspace().focused_client();
-
-        if previous != Some(window) {
-            if let Some(previous) = previous {
-                self.xserver.set_border_color(
-                    previous,
-                    self.config.unfocused_border_color(),
-                )?;
-            }
-
-            self.focused_workspace_mut()
-                .set_focused_client(window);
+        if !current.is_mapped() || (!include_floating && current.is_floating()) {
+            return None;
         }
 
-        self.xserver.set_border_color(
-            window,
-            self.config.focused_border_color(),
-        )?;
-
-        self.xserver.set_input_focus(window, time)?;
-
-        Ok(())
-    }
-
-    fn switch_workspace(&mut self, workspace: usize) -> Result<(), WmError> {
-        if workspace >= self.workspaces.len() {
-            return Ok(());
-        }
-
-        if workspace == self.focused_workspace {
-            return Ok(());
-        }
-
-        let old_workspace = self.focused_workspace;
-
-        match self.workspaces[old_workspace].focused_client() {
-            Some(window) => {
-                self.xserver.set_border_color(
-                    window,
-                    self.config.unfocused_border_color(),
-                )?;
-            }
-            None => {}
-        }
-
-        self.hide_workspace(old_workspace)?;
-
-        self.focused_workspace = workspace;
-
-        self.show_workspace(workspace)?;
-        
-        self.arrange()?;
-
-        self.xserver.update_current_workspace(workspace as u32)?;
-        
-        match self.workspaces[workspace].focused_client() {
-            Some(window) => {
-                self.focus_client(window, None)?;
-            }
-
-            None => {
-                let window = match self.workspaces[workspace].clients().first() {
-                    Some(client) => client.window(),
-                    None => {
-                        self.xserver.set_input_focus(
-                            self.xserver.root(),
-                            None,
-                        )?;
-
-                        return Ok(());
-                    }
-                };
-
-                self.focus_client(window, None)?;
-            }
-        }
-
-        Ok(())
-    }
-    
-    fn hide_workspace(&self, workspace: usize) -> Result<(), WmError> {
-        let screen = self.xserver.screen_geometry();
-        let offscreen_x = -(i32::from(screen.width) * 2);
-
-        for client in self.workspaces[workspace].clients() {
-            self.xserver.move_window(
-                client.window(),
-                offscreen_x,
-                i32::from(client.geometry().y),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn show_workspace(&self, workspace: usize) -> Result<(), WmError> {
-        for client in self.workspaces[workspace].clients() {
-            let geometry = client.geometry();
-
-            self.xserver.move_window(
-                client.window(),
-                i32::from(geometry.x),
-                i32::from(geometry.y),
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn manage_dock(&mut self, window: Window) -> Result<(), WmError> {
-        let strut = self.xserver.dock_strut(window)?;
-
-        self.dock_window = Some(window);
-        self.reserved_top = strut;
-
-        self.xserver.map_window(window)?;
-        self.arrange()?;
-
-        Ok(())
-    }
-
-    fn find_direction_target(&self, direction: Direction) -> Option<Window> {
-        let current_window = match self.focused_workspace().focused_client() {
-            Some(window) => window,
-            None => return None,
-        };
-
-        let current_geometry = match self
-            .focused_workspace()
-            .client(current_window)
-        {
-            Some(client) => client.geometry(),
-            None => return None,
-        };
-
-        let current_left = i32::from(current_geometry.x);
-        let current_top = i32::from(current_geometry.y);
-
-        let current_right =
-            current_left + i32::from(current_geometry.width);
-
-        let current_bottom =
-            current_top + i32::from(current_geometry.height);
-
-        let current_center_x =
-            current_left + i32::from(current_geometry.width) / 2;
-
-        let current_center_y =
-            current_top + i32::from(current_geometry.height) / 2;
-
-        let master_window = match self.focused_workspace().layout() {
-            Layout::MasterStack => {
-                let mut master = None;
-
-                for client in self.focused_workspace().clients() {
-                    if client.is_floating() {
-                        continue;
-                    }
-
-                    master = Some(client.window());
-                    break;
-                }
-
-                master
-            }
-
-            _ => None,
-        };
-
-        if master_window == Some(current_window) {
-            match direction {
-                Direction::Up | Direction::Down => {
-                    return None;
-                }
-
-                Direction::Left | Direction::Right => {
-                    let mut target = None;
-                    let mut target_top = i32::MAX;
-
-                    for client in self.focused_workspace().clients() {
-                        if client.is_floating() {
-                            continue;
-                        }
-
-                        let window = client.window();
-
-                        if Some(window) == master_window {
-                            continue;
-                        }
-
-                        let geometry = client.geometry();
-                        let top = i32::from(geometry.y);
-
-                        if top < target_top {
-                            target_top = top;
-                            target = Some(window);
-                        }
-                    }
-
-                    return target;
-                }
-            }
-        }
-
-        let mut target = None;
-
-        let mut best_primary_distance = i32::MAX;
-        let mut best_overlap = 0;
-        let mut best_secondary_distance = i32::MAX;
-        let mut best_position = i32::MAX;
-
-        for client in self.focused_workspace().clients() {
-            if client.is_floating() {
-                continue;
-            }
-
-            let window = client.window();
-
-            if window == current_window {
-                continue;
-            }
-
-            let geometry = client.geometry();
-
-            let left = i32::from(geometry.x);
-            let top = i32::from(geometry.y);
-
-            let right =
-                left + i32::from(geometry.width);
-
-            let bottom =
-                top + i32::from(geometry.height);
-
-            let center_x =
-                left + i32::from(geometry.width) / 2;
-
-            let center_y =
-                top + i32::from(geometry.height) / 2;
-
-            let primary_distance;
-            let overlap;
-            let secondary_distance;
-            let position;
-
-            match direction {
-                Direction::Left => {
-                    if right > current_left {
-                        continue;
-                    }
-
-                    primary_distance = current_left - right;
-
-                    overlap = Self::range_overlap(
-                        top,
-                        bottom,
-                        current_top,
-                        current_bottom,
-                    );
-
-                    secondary_distance =
-                        (current_center_y - center_y).abs();
-
-                    position = top;
-                }
-
-                Direction::Right => {
-                    if left < current_right {
-                        continue;
-                    }
-
-                    primary_distance = left - current_right;
-
-                    overlap = Self::range_overlap(
-                        top,
-                        bottom,
-                        current_top,
-                        current_bottom,
-                    );
-
-                    secondary_distance =
-                        (current_center_y - center_y).abs();
-
-                    position = top;
-                }
-
-                Direction::Up => {
-                    if bottom > current_top {
-                        continue;
-                    }
-
-                    primary_distance = current_top - bottom;
-
-                    overlap = Self::range_overlap(
-                        left,
-                        right,
-                        current_left,
-                        current_right,
-                    );
-
-                    secondary_distance =
-                        (current_center_x - center_x).abs();
-
-                    position = left;
-                }
-
-                Direction::Down => {
-                    if top < current_bottom {
-                        continue;
-                    }
-
-                    primary_distance = top - current_bottom;
-
-                    overlap = Self::range_overlap(
-                        left,
-                        right,
-                        current_left,
-                        current_right,
-                    );
-
-                    secondary_distance =
-                        (current_center_x - center_x).abs();
-
-                    position = left;
-                }
-            }
-
-            let better = if target.is_none() {
-                true
-            } else if primary_distance < best_primary_distance {
-                true
-            } else if primary_distance > best_primary_distance {
-                false
-            } else if overlap > best_overlap {
-                true
-            } else if overlap < best_overlap {
-                false
-            } else if secondary_distance < best_secondary_distance {
-                true
-            } else if secondary_distance > best_secondary_distance {
-                false
-            } else {
-                position < best_position
+        let current_geometry = current.geometry();
+
+        if workspace.layout() == Layout::Tabbed {
+            let eligible = |client: &&Client| {
+                client.is_mapped() && (include_floating || !client.is_floating())
             };
 
-            if better {
-                target = Some(window);
-                best_primary_distance = primary_distance;
-                best_overlap = overlap;
-                best_secondary_distance = secondary_distance;
-                best_position = position;
+            let mut count = 0;
+            let mut current_index = None;
+
+            for client in workspace.clients().iter().filter(eligible) {
+                if client.window() == current_window {
+                    current_index = Some(count);
+                }
+
+                count += 1;
             }
-        }
 
-        if target.is_none() {
-            let screen = self.xserver.screen_geometry();
+            let index = current_index?;
 
-            let screen_left = i32::from(screen.x);
-            let screen_top = i32::from(screen.y);
-
-            let screen_right =
-                screen_left + i32::from(screen.width);
-
-            let screen_bottom =
-                screen_top + i32::from(screen.height);
-
-            let mut best_edge_distance = i32::MAX;
-            let mut best_secondary_distance = i32::MAX;
-            let mut best_position = i32::MAX;
-
-            for client in self.focused_workspace().clients() {
-                if client.is_floating() {
-                    continue;
-                }
-
-                let window = client.window();
-
-                if window == current_window {
-                    continue;
-                }
-
-                let geometry = client.geometry();
-
-                let left = i32::from(geometry.x);
-                let top = i32::from(geometry.y);
-
-                let right =
-                    left + i32::from(geometry.width);
-
-                let bottom =
-                    top + i32::from(geometry.height);
-
-                let center_x =
-                    left + i32::from(geometry.width) / 2;
-
-                let center_y =
-                    top + i32::from(geometry.height) / 2;
-
-                let edge_distance;
-                let secondary_distance;
-                let position;
-
-                match direction {
-                    Direction::Left => {
-                        edge_distance = screen_right - right;
-
-                        secondary_distance =
-                            (current_center_y - center_y).abs();
-
-                        position = right;
-                    }
-
-                    Direction::Right => {
-                        edge_distance = left - screen_left;
-
-                        secondary_distance =
-                            (current_center_y - center_y).abs();
-
-                        position = left;
-                    }
-
-                    Direction::Up => {
-                        edge_distance = screen_bottom - bottom;
-
-                        secondary_distance =
-                            (current_center_x - center_x).abs();
-
-                        position = bottom;
-                    }
-
-                    Direction::Down => {
-                        edge_distance = top - screen_top;
-
-                        secondary_distance =
-                            (current_center_x - center_x).abs();
-
-                        position = top;
-                    }
-                }
-
-                let better = if target.is_none() {
-                    true
-                } else if edge_distance < best_edge_distance {
-                    true
-                } else if edge_distance > best_edge_distance {
-                    false
-                } else if secondary_distance < best_secondary_distance {
-                    true
-                } else if secondary_distance > best_secondary_distance {
-                    false
-                } else {
-                    position < best_position
-                };
-
-                if better {
-                    target = Some(window);
-                    best_edge_distance = edge_distance;
-                    best_secondary_distance = secondary_distance;
-                    best_position = position;
-                }
+            if count < 2 {
+                return None;
             }
+
+            let next = match direction {
+                Direction::Left | Direction::Up => (index + count - 1) % count,
+                Direction::Right | Direction::Down => (index + 1) % count,
+            };
+
+            return workspace
+                .clients()
+                .iter()
+                .filter(eligible)
+                .nth(next)
+                .map(Client::window);
         }
 
-        target
-    }
-
-    fn range_overlap(first_start: i32, first_end: i32, second_start: i32, second_end: i32) -> i32 {
-        let start = first_start.max(second_start);
-        let end = first_end.min(second_end);
-
-        if end > start {
-            end - start
-        } else {
-            0
+        if workspace.layout() == Layout::MasterStack && !current.is_floating() {
+            return self.find_master_stack_target(current_window, direction);
         }
+
+        let candidates = workspace.clients().iter().filter(|client| {
+            client.window() != current_window
+                && client.is_mapped()
+                && (include_floating || !client.is_floating())
+        });
+
+        let best_in_direction = candidates
+            .clone()
+            .filter(|candidate| is_in_direction(current_geometry, candidate.geometry(), direction))
+            .min_by_key(|candidate| {
+                direction_score(
+                    current_geometry,
+                    candidate.geometry(),
+                    candidate.window(),
+                    direction,
+                )
+            });
+
+        if let Some(candidate) = best_in_direction {
+            return Some(candidate.window());
+        }
+
+        candidates
+            .min_by_key(|candidate| wrap_score(candidate.geometry(), candidate.window(), direction))
+            .map(Client::window)
     }
 
     fn focus_direction(&mut self, direction: Direction) -> Result<(), WmError> {
-        let target = self.find_direction_target(direction);
-
-        match target {
-            Some(window) => {
-                self.focus_client(window, None)?;
-            }
-            None => {}
+        if let Some(window) = self.find_direction_target(direction, true) {
+            self.focus_client(window, None)?;
         }
-
         Ok(())
     }
 
     fn swap_direction(&mut self, direction: Direction) -> Result<(), WmError> {
-        let current_window = match self.focused_workspace().focused_client() {
-            Some(window) => window,
-            None => return Ok(()),
+        let Some(current_window) = self.focused_workspace().focused_client() else {
+            return Ok(());
         };
-
-        let target_window = match self.find_direction_target(direction) {
-            Some(window) => window,
-            None => return Ok(()),
+        let Some(target_window) = self.find_direction_target(direction, false) else {
+            return Ok(());
         };
-
         if current_window == target_window {
             return Ok(());
         }
 
-        {
-            let workspace = self.focused_workspace_mut();
-
-            let current_index = match workspace
-                .clients()
-                .iter()
-                .position(|client| client.window() == current_window)
-            {
-                Some(index) => index,
-                None => return Ok(()),
-            };
-
-            let target_index = match workspace
-                .clients()
-                .iter()
-                .position(|client| client.window() == target_window)
-            {
-                Some(index) => index,
-                None => return Ok(()),
-            };
-
-            workspace
-                .clients_mut()
-                .swap(current_index, target_index);
-        }
+        let workspace = self.focused_workspace_mut();
+        let Some(current_index) = workspace
+            .clients()
+            .iter()
+            .position(|client| client.window() == current_window)
+        else {
+            return Ok(());
+        };
+        let Some(target_index) = workspace
+            .clients()
+            .iter()
+            .position(|client| client.window() == target_window)
+        else {
+            return Ok(());
+        };
+        workspace.clients_mut().swap(current_index, target_index);
 
         self.ignore_enter_notify = true;
-
         self.arrange()?;
-
         self.focus_client(current_window, None)?;
-
         Ok(())
     }
 
-    fn move_to_workspace(&mut self, workspace: usize) -> Result<(), WmError> {
-        if workspace >= self.workspaces.len() {
+    fn move_to_workspace(&mut self, target_workspace: usize) -> Result<(), WmError> {
+        if target_workspace >= self.workspaces.len() || target_workspace == self.focused_workspace {
             return Ok(());
         }
+        self.cancel_move()?;
 
-        let current_workspace = self.focused_workspace;
-
-        if workspace == current_workspace {
+        let Some(window) = self.focused_workspace().focused_client() else {
             return Ok(());
-        }
-
-        let window = match self
-            .focused_workspace()
-            .focused_client()
-        {
-            Some(window) => window,
-            None => return Ok(()),
         };
 
-        let client = match self
-            .focused_workspace_mut()
-            .take_client(window)
-        {
-            Some(client) => client,
-            None => return Ok(()),
+        self.xserver
+            .set_border_color(window, self.config.unfocused_border_color())?;
+
+        let Some(client) = self.focused_workspace_mut().take_client(window) else {
+            return Ok(());
         };
 
-        self.workspaces[workspace].add_client(client);
-
+        self.workspaces[target_workspace].add_client(client);
         self.hide_window(window)?;
-
         self.arrange()?;
-
-        let next_window = match self
-            .focused_workspace()
-            .clients()
-            .first()
-        {
-            Some(client) => client.window(),
-            None => {
-                self.xserver.set_input_focus(
-                    self.xserver.root(),
-                    None,
-                )?;
-                
-                return Ok(());
-            }
-        };
-        
-        self.focus_client(next_window, None)?;
-        
-        Ok(())
+        self.focus_fallback(None)
     }
 
     fn hide_window(&self, window: Window) -> Result<(), WmError> {
         let screen = self.xserver.screen_geometry();
+        let offscreen_x = -i32::from(screen.width).saturating_mul(2);
+        self.xserver.move_window(window, offscreen_x, 0)?;
+        Ok(())
+    }
 
-        let x = -(i32::from(screen.width) * 2);
+    fn cancel_move(&mut self) -> Result<(), WmError> {
+        if self.moving.take().is_some() {
+            self.xserver.ungrab_pointer()?;
+        }
+        Ok(())
+    }
 
-        self.xserver.move_window(
-            window,
-            x,
-            0,
-        )?;
+    fn find_master_stack_target(
+        &self,
+        current_window: Window,
+        direction: Direction,
+    ) -> Option<Window> {
+        let tiled_windows: Vec<Window> = self
+            .focused_workspace()
+            .clients()
+            .iter()
+            .filter(|client| !client.is_floating())
+            .map(Client::window)
+            .collect();
+
+        let current_index = tiled_windows
+            .iter()
+            .position(|&window| window == current_window)?;
+
+        if current_index == 0 {
+            return match direction {
+                Direction::Right => tiled_windows.get(1).copied(),
+                Direction::Left | Direction::Up | Direction::Down => None,
+            };
+        }
+
+        let master = *tiled_windows.first()?;
+
+        match direction {
+            Direction::Left => Some(master),
+
+            Direction::Right => None,
+
+            Direction::Up if current_index > 1 => tiled_windows.get(current_index - 1).copied(),
+
+            Direction::Up => None,
+
+            Direction::Down => tiled_windows.get(current_index + 1).copied(),
+        }
+    }
+
+    fn toggle_fullscreen(&mut self) -> Result<(), WmError> {
+        let window = match self.focused_workspace().focused_client() {
+            Some(window) => window,
+            None => return Ok(()),
+        };
+
+        let fullscreen = match self.focused_workspace().client(window) {
+            Some(client) => !client.is_fullscreen(),
+            None => return Ok(()),
+        };
+
+        self.set_client_fullscreen(window, fullscreen)
+    }
+
+    fn set_client_fullscreen(&mut self, window: Window, fullscreen: bool) -> Result<(), WmError> {
+        let workspace_index = match self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.client(window).is_some())
+        {
+            Some(index) => index,
+            None => return Ok(()),
+        };
+
+        let current_state = self.workspaces[workspace_index]
+            .client(window)
+            .is_some_and(Client::is_fullscreen);
+
+        if current_state == fullscreen {
+            return Ok(());
+        }
+
+        if fullscreen {
+            let other_fullscreen_windows: Vec<Window> = self.workspaces[workspace_index]
+                .clients()
+                .iter()
+                .filter(|client| client.window() != window && client.is_fullscreen())
+                .map(Client::window)
+                .collect();
+
+            for other in other_fullscreen_windows {
+                if let Some(client) = self.workspaces[workspace_index].client_mut(other) {
+                    client.set_fullscreen(false);
+                }
+
+                self.xserver.set_fullscreen_state(other, false)?;
+            }
+        }
+
+        let client = match self.workspaces[workspace_index].client_mut(window) {
+            Some(client) => client,
+            None => return Ok(()),
+        };
+
+        client.set_fullscreen(fullscreen);
+
+        self.xserver.set_fullscreen_state(window, fullscreen)?;
+
+        if workspace_index == self.focused_workspace {
+            self.arrange()?;
+
+            if self.focused_workspace().focused_client() == Some(window) {
+                self.focus_client(window, None)?;
+            }
+        }
 
         Ok(())
     }
+}
+
+fn clamp_i16(value: i32) -> i16 {
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+}
+
+fn rect_edges(rect: Rectangle) -> (i32, i32, i32, i32) {
+    let left = i32::from(rect.x);
+    let top = i32::from(rect.y);
+    (
+        left,
+        top,
+        left + i32::from(rect.width),
+        top + i32::from(rect.height),
+    )
+}
+
+fn is_in_direction(current: Rectangle, candidate: Rectangle, direction: Direction) -> bool {
+    let (cl, ct, cr, cb) = rect_edges(current);
+    let (nl, nt, nr, nb) = rect_edges(candidate);
+    let current_cx = cl + (cr - cl) / 2;
+    let current_cy = ct + (cb - ct) / 2;
+    let next_cx = nl + (nr - nl) / 2;
+    let next_cy = nt + (nb - nt) / 2;
+
+    match direction {
+        Direction::Left => next_cx < current_cx,
+        Direction::Right => next_cx > current_cx,
+        Direction::Up => next_cy < current_cy,
+        Direction::Down => next_cy > current_cy,
+    }
+}
+
+fn direction_score(
+    current: Rectangle,
+    candidate: Rectangle,
+    window: Window,
+    direction: Direction,
+) -> (i32, u8, i32, Reverse<i32>, i32, Window) {
+    let (cl, ct, cr, cb) = rect_edges(current);
+    let (nl, nt, nr, nb) = rect_edges(candidate);
+    let (primary_gap, overlap, secondary_distance, position) = match direction {
+        Direction::Left => (
+            (cl - nr).max(0),
+            overlap_len(ct, cb, nt, nb),
+            ((ct + cb) / 2 - (nt + nb) / 2).abs(),
+            nt,
+        ),
+        Direction::Right => (
+            (nl - cr).max(0),
+            overlap_len(ct, cb, nt, nb),
+            ((ct + cb) / 2 - (nt + nb) / 2).abs(),
+            nt,
+        ),
+        Direction::Up => (
+            (ct - nb).max(0),
+            overlap_len(cl, cr, nl, nr),
+            ((cl + cr) / 2 - (nl + nr) / 2).abs(),
+            nl,
+        ),
+        Direction::Down => (
+            (nt - cb).max(0),
+            overlap_len(cl, cr, nl, nr),
+            ((cl + cr) / 2 - (nl + nr) / 2).abs(),
+            nl,
+        ),
+    };
+    (
+        primary_gap,
+        u8::from(overlap == 0),
+        secondary_distance,
+        Reverse(overlap),
+        position,
+        window,
+    )
+}
+
+fn wrap_score(
+    candidate: Rectangle,
+    window: Window,
+    direction: Direction,
+) -> (Reverse<i32>, i32, Reverse<i32>, Window) {
+    let (left, top, right, bottom) = rect_edges(candidate);
+    let center_x = left + (right - left) / 2;
+    let center_y = top + (bottom - top) / 2;
+    match direction {
+        Direction::Left => (Reverse(center_x), top, Reverse(right - left), window),
+        Direction::Right => (Reverse(-center_x), top, Reverse(right - left), window),
+        Direction::Up => (Reverse(center_y), left, Reverse(bottom - top), window),
+        Direction::Down => (Reverse(-center_y), left, Reverse(bottom - top), window),
+    }
+}
+
+fn overlap_len(first_start: i32, first_end: i32, second_start: i32, second_end: i32) -> i32 {
+    (first_end.min(second_end) - first_start.max(second_start)).max(0)
 }
