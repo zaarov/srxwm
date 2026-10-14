@@ -1,14 +1,8 @@
 use std::error::Error;
+use std::fmt::{Display, Formatter, Result};
 use std::panic::Location;
-use std::fmt::{
-    Display,
-    Result,
-    Formatter,
-};
 
-use x11rb::errors::{
-    ConnectError, ConnectionError, ReplyError, ReplyOrIdError,
-};
+use x11rb::errors::{ConnectError, ConnectionError, ReplyError, ReplyOrIdError};
 
 #[derive(Debug)]
 pub struct X11Error {
@@ -40,33 +34,19 @@ impl Display for X11Error {
             ErrorKind::Connect(e) => write!(
                 f,
                 "failed to connect to X server: {} (at {})",
-                e,
-                self.location,
+                e, self.location,
             ),
-            ErrorKind::Connection(e) => write!(
-                f,
-                "X11 connection error: {} (at {})",
-                e,
-                self.location,
-            ),
-            ErrorKind::Reply(e) => write!(
-                f,
-                "X11 reply error: {} (at {})",
-                e,
-                self.location,
-            ),
-            ErrorKind::ReplyOrId(e) => write!(
-                f,
-                "reply/id error: {} (at {})",
-                e,
-                self.location,
-            ),
+            ErrorKind::Connection(e) => {
+                write!(f, "X11 connection error: {} (at {})", e, self.location,)
+            }
+            ErrorKind::Reply(e) => write!(f, "X11 reply error: {} (at {})", e, self.location,),
+            ErrorKind::ReplyOrId(e) => write!(f, "reply/id error: {} (at {})", e, self.location,),
         }
     }
 }
 
 impl Error for X11Error {
-    fn source(&self) ->  Option <&(dyn Error + 'static)> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ErrorKind::Connect(error) => Some(error),
             ErrorKind::Connection(error) => Some(error),
