@@ -26,22 +26,22 @@
 
       in {
 	      devShells.default = with pkgs; mkShell {
-	        buildInputs = [
+          buildInputs = [
             rustToolchain
             pkg-config
 
-	          # Packages for window manager test
-	          feh
+            # Packages for window manager test
+            feh
             rofi
             picom
-	          alacritty
-	          polybar
-	          cowsay
+            alacritty
+            polybar
+            cowsay
 	        ];
 
-	        shellHook = ''
+          shellHook = ''
             echo "Rust environment activated."
-	        '';
+          '';
 	      };
       }
     );
