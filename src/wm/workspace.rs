@@ -2,14 +2,14 @@ use x11rb::protocol::xproto::Window;
 
 use super::Client;
 
-
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     MasterStack,
     Tree,
     Horizontal,
     Vertical,
     Tabbed,
-    Floating
+    Floating,
 }
 
 pub struct Workspace {
@@ -20,9 +20,9 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new() -> Self {
-        Self { 
+        Self {
             clients: Vec::new(),
-            focused_client: None, 
+            focused_client: None,
             layout: Layout::MasterStack,
         }
     }
@@ -40,7 +40,7 @@ impl Workspace {
     }
 
     pub fn set_focused_client(&mut self, window: Window) {
-        if self.client(window).is_some() {
+        if self.client(window).is_some_and(Client::is_mapped) {
             self.focused_client = Some(window);
         }
     }
@@ -49,14 +49,16 @@ impl Workspace {
         self.focused_client = None;
     }
 
-    pub fn layout(&self) -> &Layout {
-        &self.layout
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
     }
 
     pub fn client(&self, window: Window) -> Option<&Client> {
-        self.clients
-            .iter()
-            .find(|client| client.window() == window)
+        self.clients.iter().find(|client| client.window() == window)
     }
 
     pub fn client_mut(&mut self, window: Window) -> Option<&mut Client> {
@@ -64,35 +66,47 @@ impl Workspace {
             .iter_mut()
             .find(|client| client.window() == window)
     }
-    
+
     pub fn add_client(&mut self, client: Client) {
-        self.clients.push(client);
+        if self.client(client.window()).is_none() {
+            self.clients.push(client);
+        }
     }
 
-    pub fn remove_client(&mut self, window: Window) {
-        self.clients.retain(|client| client.window() != window);
+    pub fn remove_client(&mut self, window: Window) -> Option<Client> {
+        let index = self
+            .clients
+            .iter()
+            .position(|client| client.window() == window)?;
+        let removed = self.clients.remove(index);
 
         if self.focused_client == Some(window) {
-            self.focused_client = self.clients.last().map(|client| client.window());
+            self.focused_client = self.clients[index.min(self.clients.len())..]
+                .iter()
+                .find(|client| client.is_mapped())
+                .or_else(|| {
+                    self.clients[..index.min(self.clients.len())]
+                        .iter()
+                        .rev()
+                        .find(|client| client.is_mapped())
+                })
+                .map(Client::window);
+        } else if self
+            .focused_client
+            .is_some_and(|focused| !self.client(focused).is_some_and(Client::is_mapped))
+        {
+            self.focused_client = self
+                .clients
+                .iter()
+                .find(|client| client.is_mapped())
+                .map(Client::window);
         }
+
+        Some(removed)
     }
 
     pub fn take_client(&mut self, window: Window) -> Option<Client> {
-        let index = match self
-            .clients
-            .iter()
-            .position(|client| client.window() == window)
-        {
-            Some(index) => index,
-            None => return None,
-        };
-
-        let client = self.clients.remove(index);
-
-        if self.focused_client == Some(window) {
-            self.clear_focused_client();
-        }
-
-        Some(client)
+        self.remove_client(window)
     }
 }
+
