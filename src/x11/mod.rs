@@ -8,19 +8,19 @@ mod cursor;
 use cursor::Cursors;
 
 use x11rb::connection::Connection;
-use x11rb::rust_connection::RustConnection;
-use x11rb::protocol::Event;
 use x11rb::cookie::VoidCookie;
+use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
     AtomEnum,
+    ButtonIndex,
     ChangeWindowAttributesAux,
     ClientMessageData,
     ClientMessageEvent,
+    ConfigureRequestEvent,
     ConfigureWindowAux,
     ConnectionExt,
     CreateWindowAux,
     EventMask,
-    GetPropertyReply,
     GrabMode,
     InputFocus,
     Keycode,
@@ -28,14 +28,42 @@ use x11rb::protocol::xproto::{
     PropMode,
     Rectangle,
     Screen,
+    StackMode,
     Timestamp,
     Window,
     WindowClass,
-    ConfigureRequestEvent,
-    ButtonIndex,
 };
+use x11rb::rust_connection::RustConnection;
 
 use xkeysym::Keysym;
+
+const WM_NAME: &[u8] = b"srxwm";
+
+#[derive(Clone, Copy)]
+pub struct DockStrut {
+    left: u32,
+    right: u32,
+    top: u32,
+    bottom: u32,
+}
+
+impl DockStrut {
+    pub fn left(&self) -> u32 {
+        self.left
+    }
+
+    pub fn right(&self) -> u32 {
+        self.right
+    }
+
+    pub fn top(&self) -> u32 {
+        self.top
+    }
+
+    pub fn bottom(&self) -> u32 {
+        self.bottom
+    }
+}
 
 pub struct XServer {
     conn: RustConnection,
@@ -67,21 +95,20 @@ impl XServer {
         Ok(())
     }
 
+    pub fn screen(&self) -> &Screen {
+        &self.conn.setup().roots[self.screen_num]
+    }
+
     pub fn root(&self) -> Window {
-        let screen: &Screen = self.screen();
-        screen.root
+        self.screen().root
     }
 
     pub fn atoms(&self) -> &Atoms {
         &self.atoms
     }
 
-    pub fn screen(&self) -> &Screen {
-        &self.conn.setup().roots[self.screen_num]
-    }
-
     pub fn screen_geometry(&self) -> Rectangle {
-        let screen: &Screen = self.screen();
+        let screen = self.screen();
 
         Rectangle {
             x: 0,
@@ -94,13 +121,15 @@ impl XServer {
     pub fn claim_wm(&self) -> Result<(), X11Error> {
         let cookie: VoidCookie<'_, RustConnection> = self.conn.change_window_attributes(
             self.root(),
-            &ChangeWindowAttributesAux::new().event_mask(
-                EventMask::SUBSTRUCTURE_REDIRECT 
-                    | EventMask::SUBSTRUCTURE_NOTIFY,
-            ),
+            &ChangeWindowAttributesAux::new()
+                .event_mask(
+                    EventMask::SUBSTRUCTURE_REDIRECT
+                        | EventMask::SUBSTRUCTURE_NOTIFY
+                ),
         )?;
 
         cookie.check()?;
+        
         Ok(())
     }
 
@@ -143,16 +172,14 @@ impl XServer {
             &window_bytes,
         )?;
 
-        let name: &[u8; 5] = b"srxwm";
-        
         self.conn.change_property(
             PropMode::REPLACE,
             wm_check_window,
             self.atoms.NetWmName,
             self.atoms.UTF8String,
             8,
-            name.len() as u32,
-            name,
+            WM_NAME.len() as u32,
+            WM_NAME,
         )?;
 
         Ok(())
@@ -179,21 +206,22 @@ impl XServer {
         Ok(())
     }
 
-    pub fn set_input_focus(&self, window: Window, timestamp: Option<Timestamp>) -> Result<(), X11Error> {
+    pub fn set_input_focus(
+        &self,
+        window: Window,
+        timestamp: Option<Timestamp>,
+    ) -> Result<(), X11Error> {
         let timestamp = match timestamp {
             Some(timestamp) => timestamp,
             None => x11rb::CURRENT_TIME,
         };
-        
-        self.conn.set_input_focus(
-            InputFocus::PARENT,
-            window,
-            timestamp,
-        )?;
+
+        self.conn
+            .set_input_focus(InputFocus::PARENT, window, timestamp)?;
 
         Ok(())
     }
-    
+
     pub fn map_window(&self, window: Window) -> Result<(), X11Error> {
         self.conn.map_window(window)?;
         Ok(())
@@ -204,46 +232,29 @@ impl XServer {
         Ok(())
     }
 
-    // Refactor this
     pub fn close_window(&self, window: Window, timestamp: u32) -> Result<(), X11Error> {
-        let atoms: &Atoms = self.atoms();
+        let atoms = self.atoms();
 
-        let reply: GetPropertyReply = self.conn.get_property(
-            false,
-            window,
-            atoms.WmProtocols,
-            AtomEnum::ATOM,
-            0,
-            64,
-        )?
+        let reply = self
+            .conn
+            .get_property(false, window, atoms.WmProtocols, AtomEnum::ATOM, 0, 64)?
             .reply()?;
 
-        let supports_delete: bool = match reply.value32() {
-            Some(mut iter) => iter.any(|atom| atom == atoms.WmDeleteWindow),
+        let supports_delete = match reply.value32() {
+            Some(mut values) => values.any(|atom| atom == atoms.WmDeleteWindow),
             None => false,
         };
 
         if supports_delete {
-            let event: ClientMessageEvent = ClientMessageEvent::new(
+            let event = ClientMessageEvent::new(
                 32,
                 window,
                 atoms.WmProtocols,
-                ClientMessageData::from([
-                    atoms.WmDeleteWindow,
-                    timestamp,
-                    0,
-                    0,
-                    0,
-                ]),
+                ClientMessageData::from([atoms.WmDeleteWindow, timestamp, 0, 0, 0]),
             );
 
-            self.conn.send_event(
-                false, 
-                window, 
-                EventMask::NO_EVENT, 
-                event,
-            )?;
-
+            self.conn
+                .send_event(false, window, EventMask::NO_EVENT, event)?;
         } else {
             self.conn.destroy_window(window)?;
         }
@@ -251,7 +262,12 @@ impl XServer {
         Ok(())
     }
 
-    pub fn configure_window(&self, window: Window, geometry: Rectangle, border: u32) -> Result<(), X11Error> {
+    pub fn configure_window(
+        &self,
+        window: Window,
+        geometry: Rectangle,
+        border: u32,
+    ) -> Result<(), X11Error> {
         self.conn.configure_window(
             window,
             &ConfigureWindowAux::new()
@@ -261,33 +277,83 @@ impl XServer {
                 .height(u32::from(geometry.height))
                 .border_width(border),
         )?;
-        
+
         Ok(())
     }
 
-    // TODO: refactor this 
+    pub fn raise_window(&self, window: Window) -> Result<(), X11Error> {
+        self.conn.configure_window(
+            window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+
+        Ok(())
+    }
+
+    pub fn set_fullscreen_state(&self, window: Window, fullscreen: bool) -> Result<(), X11Error> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.NetWmState,
+                AtomEnum::ATOM,
+                0,
+                1024,
+            )?
+            .reply()?;
+
+        let mut states: Vec<u32> = reply
+            .value32()
+            .map(|values| values.collect())
+            .unwrap_or_default();
+
+        let fullscreen_atom = self.atoms.NetWmStateFullscreen;
+
+        states.retain(|&atom| atom != fullscreen_atom);
+
+        if fullscreen {
+            states.push(fullscreen_atom);
+        }
+
+        let data: Vec<u8> = states.iter().flat_map(|atom| atom.to_ne_bytes()).collect();
+
+        self.conn.change_property(
+            PropMode::REPLACE,
+            window,
+            self.atoms.NetWmState,
+            AtomEnum::ATOM,
+            32,
+            states.len() as u32,
+            &data,
+        )?;
+
+        Ok(())
+    }
+
     pub fn configure_window_request(&self, event: &ConfigureRequestEvent) -> Result<(), X11Error> {
         let aux = ConfigureWindowAux::from_configure_request(event);
 
-        self.conn.configure_window(
-            event.window,
-            &aux,
-        )?;
+        self.conn.configure_window(event.window, &aux)?;
 
         Ok(())
     }
-    
+
     pub fn set_border_color(&self, window: Window, color: u32) -> Result<(), X11Error> {
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .border_pixel(color),
+            &ChangeWindowAttributesAux::new().border_pixel(color),
         )?;
 
         Ok(())
     }
 
-    pub fn grab_button(&self, window: Window, button: ButtonIndex, modifiers: ModMask) -> Result<(), X11Error> {
+    pub fn grab_button(
+        &self,
+        window: Window,
+        button: ButtonIndex,
+        modifiers: ModMask,
+    ) -> Result<(), X11Error> {
         self.conn.grab_button(
             false,
             window,
@@ -304,16 +370,18 @@ impl XServer {
     }
 
     pub fn grab_pointer_move(&self) -> Result<(), X11Error> {
-        self.conn.grab_pointer(
-            false,
-            self.root(),
-            EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            self.cursors.move_(),
-            x11rb::CURRENT_TIME,
-        )?.reply()?;
+        self.conn
+            .grab_pointer(
+                false,
+                self.root(),
+                EventMask::BUTTON_RELEASE | EventMask::POINTER_MOTION,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                self.cursors.move_(),
+                x11rb::CURRENT_TIME,
+            )?
+            .reply()?;
 
         Ok(())
     }
@@ -324,10 +392,7 @@ impl XServer {
     }
 
     pub fn grab_key(&self, keycode: Keycode, modifiers: ModMask) -> Result<(), X11Error> {
-        let modifier_variants = [
-            modifiers,
-            modifiers | ModMask::LOCK,
-        ];
+        let modifier_variants = [modifiers, modifiers | ModMask::LOCK];
 
         for modifiers in modifier_variants {
             self.conn.grab_key(
@@ -343,19 +408,26 @@ impl XServer {
         Ok(())
     }
 
+    pub fn ungrab_key(&self, keycode: Keycode, modifiers: ModMask) -> Result<(), X11Error> {
+        let modifier_variants = [modifiers, modifiers | ModMask::LOCK];
+
+        for modifiers in modifier_variants {
+            self.conn.ungrab_key(keycode, self.root(), modifiers)?;
+        }
+
+        Ok(())
+    }
+
     pub fn keycodes_for_keysym(&self, keysym: Keysym) -> Result<Vec<Keycode>, X11Error> {
-        let raw: u32 = keysym.raw();
+        let raw = keysym.raw();
 
         let setup = self.conn.setup();
-        let min: Keycode = setup.min_keycode;
-        let count: u8 = setup.max_keycode - min + 1;
+        let min = setup.min_keycode;
+        let count = setup.max_keycode - min + 1;
 
-        let reply = self.conn.get_keyboard_mapping(
-            min,
-            count,
-        )?.reply()?;
+        let reply = self.conn.get_keyboard_mapping(min, count)?.reply()?;
 
-        let per: usize = reply.keysyms_per_keycode as usize;
+        let per = reply.keysyms_per_keycode as usize;
 
         if per == 0 {
             return Ok(Vec::new());
@@ -368,14 +440,12 @@ impl XServer {
                 continue;
             }
 
-            let index: u8 = match u8::try_from(index) {
-                Ok(index) => index,
-                Err(_) => continue,
+            let Ok(index) = u8::try_from(index) else {
+                continue;
             };
 
-            let keycode: Keycode = match min.checked_add(index) {
-                Some(keycode) => keycode,
-                None => continue,
+            let Some(keycode) = min.checked_add(index) else {
+                continue;
             };
 
             keycodes.push(keycode);
@@ -383,74 +453,71 @@ impl XServer {
 
         Ok(keycodes)
     }
-    
+
     pub fn select_window_events(&self, window: Window) -> Result<(), X11Error> {
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .event_mask(
-                    EventMask::ENTER_WINDOW
-                        | EventMask::SUBSTRUCTURE_NOTIFY
-                        | EventMask::PROPERTY_CHANGE
-                ),
+            &ChangeWindowAttributesAux::new().event_mask(
+                EventMask::ENTER_WINDOW
+                    | EventMask::SUBSTRUCTURE_NOTIFY
+                    | EventMask::PROPERTY_CHANGE,
+            ),
         )?;
 
         Ok(())
     }
 
     pub fn should_float(&self, window: Window) -> Result<bool, X11Error> {
-        let reply = self.conn.get_property(
-            false,
-            window,
-            self.atoms.NetWmWindowType,
-            AtomEnum::ATOM,
-            0,
-            32,
-        )?.reply()?;
-        
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.NetWmWindowType,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )?
+            .reply()?;
+
         if reply.format != 32 {
             return Ok(false);
         }
-        
+
         for chunk in reply.value.chunks_exact(4) {
-            let atom = u32::from_ne_bytes([
-                chunk[0],
-                chunk[1],
-                chunk[2],
-                chunk[3],
-            ]);
-            
+            let atom = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+
             if atom == self.atoms.NetWmWindowTypeDialog
                 || atom == self.atoms.NetWmWindowTypeSplash
-                || atom ==self.atoms.NetWmWindowTypeUtility
-                || atom == self.atoms.NetWmWindowTypeToolbar {
-                    return Ok(true);
-                }
+                || atom == self.atoms.NetWmWindowTypeUtility
+                || atom == self.atoms.NetWmWindowTypeToolbar
+            {
+                return Ok(true);
+            }
         }
+
         Ok(false)
     }
 
     pub fn is_dock_window(&self, window: Window) -> Result<bool, X11Error> {
-        let reply = self.conn.get_property(
-            false,
-            window,
-            self.atoms.NetWmWindowType,
-            AtomEnum::ATOM,
-            0,
-            32,
-        )?.reply()?;
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.NetWmWindowType,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )?
+            .reply()?;
 
         if reply.format != 32 {
             return Ok(false);
         }
 
         for chunk in reply.value.chunks_exact(4) {
-            let atom = u32::from_ne_bytes([
-                chunk[0],
-                chunk[1],
-                chunk[2],
-                chunk[3],
-            ]);
+            let atom = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
 
             if atom == self.atoms.NetWmWindowTypeDock {
                 return Ok(true);
@@ -460,48 +527,63 @@ impl XServer {
         Ok(false)
     }
 
-    pub fn dock_strut(&self, window: Window) -> Result<u32, X11Error> {
-        let reply = self.conn.get_property(
-            false,
-            window,
-            self.atoms.NetWmStrutPartial,
-            AtomEnum::CARDINAL,
-            0,
-            12,
-        )?.reply()?;
+    pub fn dock_strut(&self, window: Window) -> Result<DockStrut, X11Error> {
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.NetWmStrutPartial,
+                AtomEnum::CARDINAL,
+                0,
+                12,
+            )?
+            .reply()?;
 
-        if reply.format != 32 {
-            return Ok(0);
+        let partial: Vec<u32> = if reply.format == 32 {
+            reply
+                .value32()
+                .map(|values| values.collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if partial.len() >= 12 {
+            return Ok(DockStrut {
+                left: partial[0],
+                right: partial[1],
+                top: partial[2],
+                bottom: partial[3],
+            });
         }
 
-        let mut values = match reply.value32() {
-            Some(values) => values,
-            None => return Ok(0),
+        let reply = self
+            .conn
+            .get_property(
+                false,
+                window,
+                self.atoms.NetWmStrut,
+                AtomEnum::CARDINAL,
+                0,
+                4,
+            )?
+            .reply()?;
+
+        let legacy: Vec<u32> = if reply.format == 32 {
+            reply
+                .value32()
+                .map(|values| values.collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
 
-        let left = match values.next() {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-
-        let right = match values.next() {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-
-        let top = match values.next() {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-
-        let bottom = match values.next() {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-
-        let _ = (left, right, bottom);
-
-        Ok(top)
+        Ok(DockStrut {
+            left: legacy.first().copied().unwrap_or(0),
+            right: legacy.get(1).copied().unwrap_or(0),
+            top: legacy.get(2).copied().unwrap_or(0),
+            bottom: legacy.get(3).copied().unwrap_or(0),
+        })
     }
 
     pub fn window_geometry(&self, window: Window) -> Result<Rectangle, X11Error> {
@@ -516,12 +598,8 @@ impl XServer {
     }
 
     pub fn move_window(&self, window: Window, x: i32, y: i32) -> Result<(), X11Error> {
-        self.conn.configure_window(
-            window,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y),
-        )?;
+        self.conn
+            .configure_window(window, &ConfigureWindowAux::new().x(x).y(y))?;
 
         Ok(())
     }
@@ -529,8 +607,7 @@ impl XServer {
     pub fn set_normal_cursor(&self, window: Window) -> Result<(), X11Error> {
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .cursor(self.cursors.normal()),
+            &ChangeWindowAttributesAux::new().cursor(self.cursors.normal()),
         )?;
 
         Ok(())
@@ -539,8 +616,7 @@ impl XServer {
     pub fn set_move_cursor(&self, window: Window) -> Result<(), X11Error> {
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .cursor(self.cursors.move_()),
+            &ChangeWindowAttributesAux::new().cursor(self.cursors.move_()),
         )?;
 
         Ok(())
@@ -549,14 +625,17 @@ impl XServer {
     pub fn set_resize_cursor(&self, window: Window) -> Result<(), X11Error> {
         self.conn.change_window_attributes(
             window,
-            &ChangeWindowAttributesAux::new()
-                .cursor(self.cursors.resize()),
+            &ChangeWindowAttributesAux::new().cursor(self.cursors.resize()),
         )?;
 
         Ok(())
     }
 
-    pub fn setup_desktops(&self, num_workspaces: usize, workspaces_names: &[u8]) -> Result<(), X11Error> {
+    pub fn setup_desktops(
+        &self,
+        num_workspaces: usize,
+        workspaces_names: &[u8],
+    ) -> Result<(), X11Error> {
         let num_workspaces = num_workspaces as u32;
         self.conn.change_property(
             PropMode::REPLACE,
@@ -590,6 +669,38 @@ impl XServer {
             32,
             1,
             &current_workspace.to_ne_bytes(),
+        )?;
+
+        Ok(())
+    }
+
+    pub fn update_workarea(&self, area: Rectangle, workspace_count: usize) -> Result<(), X11Error> {
+        let values_per_workspace = [
+            i32::from(area.x).max(0) as u32,
+            i32::from(area.y).max(0) as u32,
+            u32::from(area.width),
+            u32::from(area.height),
+        ];
+
+        let mut values = Vec::with_capacity(workspace_count.saturating_mul(4));
+
+        for _ in 0..workspace_count {
+            values.extend_from_slice(&values_per_workspace);
+        }
+
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+
+        self.conn.change_property(
+            PropMode::REPLACE,
+            self.root(),
+            self.atoms.NetWorkarea,
+            AtomEnum::CARDINAL,
+            32,
+            values.len() as u32,
+            &data,
         )?;
 
         Ok(())
