@@ -1,11 +1,8 @@
 use crate::x11::X11Error;
 
-use x11rb::rust_connection::RustConnection;
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    Cursor,
-    ConnectionExt,
-};
+use x11rb::protocol::xproto::{ConnectionExt, Cursor};
+use x11rb::rust_connection::RustConnection;
 
 const XC_FLEUR: u16 = 52;
 const XC_LEFT_PTR: u16 = 68;
@@ -19,7 +16,6 @@ pub struct Cursors {
 
 impl Cursors {
     pub fn new(conn: &RustConnection) -> Result<Self, X11Error> {
-    
         let cursor_font = conn.generate_id()?;
 
         conn.open_font(cursor_font, b"cursor")?;
@@ -91,4 +87,3 @@ impl Cursors {
         self.resize
     }
 }
-
