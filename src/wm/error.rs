@@ -1,10 +1,6 @@
 use std::error::Error;
+use std::fmt::{Display, Formatter, Result};
 use std::panic::Location;
-use std::fmt::{
-    Display,
-    Result,
-    Formatter,
-};
 
 use crate::x11;
 
@@ -33,18 +29,8 @@ impl WmError {
 impl Display for WmError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         match &self.kind {
-            ErrorKind::X11(e) => write!(
-                f,
-                "X11 error: {} (at {})",
-                e,
-                self.location,
-            ),
-            ErrorKind::Io(error) => write!(
-                f,
-                "I/O error: {} (at {})",
-                error,
-                self.location,
-            ),
+            ErrorKind::X11(e) => write!(f, "X11 error: {} (at {})", e, self.location,),
+            ErrorKind::Io(error) => write!(f, "I/O error: {} (at {})", error, self.location,),
         }
     }
 }
