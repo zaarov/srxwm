@@ -1,10 +1,10 @@
-mod x11;
-mod wm;
 mod config;
+mod wm;
+mod x11;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("simp-wm: {error}");
+        eprintln!("simp-wm: {}", error);
         std::process::exit(1);
     }
 }
