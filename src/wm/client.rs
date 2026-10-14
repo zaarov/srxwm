@@ -10,12 +10,12 @@ pub struct Client {
 
 impl Client {
     pub fn new(window: Window, geometry: Rectangle) -> Self {
-        Self { 
+        Self {
             window,
             geometry,
-            mapped: false, 
-            floating: false, 
-            fullscreen: false, 
+            mapped: false,
+            floating: false,
+            fullscreen: false,
         }
     }
 
